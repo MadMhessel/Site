@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>СтройМаркет - Автономный Каталог</title>
+    <!-- Подключение Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css">
+    <style>
+        /* Настройка шрифта и скроллинга */
+        body {
+            font-family: 'Inter', sans-serif;
+            min-height: 100vh;
+            background-color: #f3f4f6;
+        }
+        /* Адаптивное центрирование для карточек */
+        .grid-container {
+            display: grid;
+            gap: 24px;
+            padding: 24px;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        }
+        /* Стили для типографики на статических страницах */
+        .prose {
+            color: #374151;
+        }
+        .prose h2 {
+            font-size: 1.875rem;
+            font-weight: 700;
+            margin-bottom: 1.5rem;
+            border-bottom: 1px solid #e5e7eb;
+            padding-bottom: 0.5rem;
+        }
+        .prose h3 {
+             font-size: 1.5rem;
+             font-weight: 700;
+             margin-bottom: 1rem;
+        }
+        .prose p, .prose ul, .prose ol {
+            line-height: 1.75;
+            margin-bottom: 1.25rem;
+        }
+         /* Анимация для всплывающих сообщений */
+        @keyframes fade-in-down {
+            from {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        .animate-fade-in-down {
+            animation: fade-in-down 0.5s ease-out forwards;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="app" class="min-h-screen">
+        <!-- Содержимое будет сгенерировано JS -->
+    </div>
+
+    <!-- Подключаем файл с каталогом -->
+    <script src="catalog.js"></script>
+    <!-- Загрузка единого файла логики -->
+    <script src="app.js"></script>
+
+</body>
+</html>
+
