@@ -30,6 +30,11 @@ function buildProductHash(slug) {
     return safeSlug ? `#/product/${safeSlug}` : '#/';
 }
 
+function buildCategoryHash(slug) {
+    const safeSlug = slug ? encodeURIComponent(slug) : '';
+    return safeSlug ? `#/category/${safeSlug}` : getHashForView('catalog');
+}
+
 function getCurrentHashSegment() {
     const hash = window.location.hash || '';
     return hash.replace(/^#\/?/, '').replace(/\/+$/, '');
@@ -306,6 +311,7 @@ let appState = {
     onlyWithPrice: false,
     isMenuOpen: false,
     isCatalogMenuOpen: false,
+    selectedCategorySlug: null,
     activeSlide: 0,
     slides: [
         { image: 'https://i.imgur.com/YDb3Aq1.jpeg' },
@@ -317,18 +323,114 @@ let appState = {
         { image: 'https://i.imgur.com/mnezRSJ.jpeg' }
     ],
     catalogCategories: [
-        { icon: 'fa-ruler-combined', title: 'Кровельные материалы', image: 'https://i.imgur.com/YDb3Aq1.jpeg', links: ['Рулонная кровля', 'Гибкая черепица', 'Комплектующие', 'Инструменты', 'Кровельные ограждения', 'Антисептики для кровли', 'ПВХ и ТПО мембраны'] },
-        { icon: 'fa-thermometer-half', title: 'Изоляция', image: 'https://i.imgur.com/FvJgTnS.jpeg', links: ['Праймеры', 'Мастики', 'Герметики', 'Звукоизоляция', 'Комплектующие'] },
-        { icon: 'fa-water', title: 'Гидроизоляция', image: 'https://i.imgur.com/RTedE0r.jpeg', links: ['Рулонная гидроизоляция', 'Профилированные мембраны', 'Инструменты', 'Обмазочная гидроизоляция', 'Жидкая резина', 'Промоборудование'] },
-        { icon: 'fa-tv', title: 'Теплоизоляция', image: 'https://i.imgur.com/UpOzPlt.jpeg', links: ['Экструзионный пенополистирол', 'Стекловата', 'Напыляемый утеплитель', 'Пенопласт', 'Вспененный полиэтилен', 'Крепеж для теплоизоляции'] },
-        { icon: 'fa-building', title: 'Фасадные материалы', image: 'https://i.imgur.com/we90y0H.jpeg', links: ['Фасадные плиты', 'Композитные панели', 'Штукатурно-клеевые смеси', 'Фасадные штукатурки'] },
-        { icon: 'fa-tools', title: 'Стройматериалы', image: 'https://i.imgur.com/nK2SB1P.jpeg', links: ['Цемент, кладка и сыпучие', 'Монтажные клеи', 'Древесно-плитные материалы', 'Гипсокартон и листовые', 'Строительные сетки', 'Стеклопластиковая арматура', 'Шифер'] },
-        { icon: 'fa-tint', title: 'Водосточные системы', image: 'https://i.imgur.com/mnezRSJ.jpeg', links: ['ПВХ системы', 'Металлические системы'] },
-        { icon: 'fa-box', title: 'Сухие смеси', image: 'https://placehold.co/150x100/cccccc/969696?text=Сухие+смеси', links: ['Полимерные клеи', 'Штукатурки', 'Шпатлевки', 'Наливные полы', 'Кладочные смеси', 'Грунтовки'] },
-        { icon: 'fa-home', title: 'Готовые домокомплекты', image: 'https://placehold.co/150x100/cccccc/969696?text=Дома', links: ['Садовые домики', 'Хозблоки', 'Беседки', 'Гаражи'] },
-        { icon: 'fa-spray-can', title: 'Герметики и пены', image: 'https://placehold.co/150x100/cccccc/969696?text=Пены', links: ['Монтажные пены', 'Герметики', 'Очистители пены', 'Лента герметик'] },
-        { icon: 'fa-leaf', title: 'Пароизоляция', image: 'https://placehold.co/150x100/cccccc/969696?text=Пленки', links: ['Паро-ветрозащитные пленки', 'Диффузионные мембраны'] },
-        { icon: 'fa-flask', title: 'Строительная химия', image: 'https://placehold.co/150x100/cccccc/969696?text=Химия', links: ['Антисептики для древесины', 'Отбеливатели для древесины', 'Огнебиозащита', 'Удалители высолов'] },
+        {
+            icon: 'fa-ruler-combined',
+            title: 'Кровельные материалы',
+            slug: 'krovelnye-materialy',
+            image: 'https://i.imgur.com/YDb3Aq1.jpeg',
+            description: 'Готовые решения для монтажа и ремонта кровель: от мембран и черепицы до аксессуаров, обеспечивающих герметичность и долговечность кровельного пирога.',
+            keywords: ['кровель', 'черепиц', 'воронк', 'мембран', 'кровля'],
+            links: ['Рулонная кровля', 'Гибкая черепица', 'Комплектующие', 'Инструменты', 'Кровельные ограждения', 'Антисептики для кровли', 'ПВХ и ТПО мембраны'],
+        },
+        {
+            icon: 'fa-thermometer-half',
+            title: 'Изоляция',
+            slug: 'izolyaciya',
+            image: 'https://i.imgur.com/FvJgTnS.jpeg',
+            description: 'Материалы для защиты конструкций от влаги, шума и перепадов температур, включая мастики, праймеры и комплектующие.',
+            keywords: ['изоляц', 'шумоизоляц', 'праймер', 'мастик'],
+            links: ['Праймеры', 'Мастики', 'Герметики', 'Звукоизоляция', 'Комплектующие'],
+        },
+        {
+            icon: 'fa-water',
+            title: 'Гидроизоляция',
+            slug: 'gidroizolyaciya',
+            image: 'https://i.imgur.com/RTedE0r.jpeg',
+            description: 'Современные решения для защиты от влаги и протечек: рулонная и обмазочная гидроизоляция, профилированные мембраны и оборудование.',
+            keywords: ['гидроизоляц', 'жидкая резина', 'профилированные мембраны'],
+            links: ['Рулонная гидроизоляция', 'Профилированные мембраны', 'Инструменты', 'Обмазочная гидроизоляция', 'Жидкая резина', 'Промоборудование'],
+        },
+        {
+            icon: 'fa-tv',
+            title: 'Теплоизоляция',
+            slug: 'teploizolyaciya',
+            image: 'https://i.imgur.com/UpOzPlt.jpeg',
+            description: 'Широкий выбор материалов для утепления кровли, фасадов и перекрытий: от экструдированного пенополистирола до напыляемых систем.',
+            keywords: ['теплоизоляц', 'утепл', 'пенополистирол', 'минераловат'],
+            links: ['Экструзионный пенополистирол', 'Стекловата', 'Напыляемый утеплитель', 'Пенопласт', 'Вспененный полиэтилен', 'Крепеж для теплоизоляции'],
+        },
+        {
+            icon: 'fa-building',
+            title: 'Фасадные материалы',
+            slug: 'fasadnye-materialy',
+            image: 'https://i.imgur.com/we90y0H.jpeg',
+            description: 'Комплексные решения для облицовки и защиты фасадов: панели, плиты и штукатурно-клеевые системы.',
+            keywords: ['фасад', 'облицовк', 'панел', 'фасадные'],
+            links: ['Фасадные плиты', 'Композитные панели', 'Штукатурно-клеевые смеси', 'Фасадные штукатурки'],
+        },
+        {
+            icon: 'fa-tools',
+            title: 'Стройматериалы',
+            slug: 'stroymaterialy',
+            image: 'https://i.imgur.com/nK2SB1P.jpeg',
+            description: 'Базовые строительные материалы для возведения и ремонта: от цемента и арматуры до листовых и плитных изделий.',
+            keywords: ['строител', 'строиматериал', 'цемент', 'арматур', 'гипсокартон'],
+            links: ['Цемент, кладка и сыпучие', 'Монтажные клеи', 'Древесно-плитные материалы', 'Гипсокартон и листовые', 'Строительные сетки', 'Стеклопластиковая арматура', 'Шифер'],
+        },
+        {
+            icon: 'fa-tint',
+            title: 'Водосточные системы',
+            slug: 'vodostochnye-sistemy',
+            image: 'https://i.imgur.com/mnezRSJ.jpeg',
+            description: 'Пластиковые и металлические системы водоотведения для надежной защиты кровли и фасадов от осадков.',
+            keywords: ['водосточ', 'водоотведен', 'дренаж', 'желоб'],
+            links: ['ПВХ системы', 'Металлические системы'],
+        },
+        {
+            icon: 'fa-box',
+            title: 'Сухие смеси',
+            slug: 'suhie-smesi',
+            image: 'https://placehold.co/150x100/cccccc/969696?text=Сухие+смеси',
+            description: 'Штукатурки, шпаклевки, наливные полы и другие смеси для внутренней и наружной отделки.',
+            keywords: ['сухие смеси', 'шпатлев', 'штукатур', 'наливн', 'смесь'],
+            links: ['Полимерные клеи', 'Штукатурки', 'Шпатлевки', 'Наливные полы', 'Кладочные смеси', 'Грунтовки'],
+        },
+        {
+            icon: 'fa-home',
+            title: 'Готовые домокомплекты',
+            slug: 'gotovye-domokomplekty',
+            image: 'https://placehold.co/150x100/cccccc/969696?text=Дома',
+            description: 'Проектные решения для быстрого возведения домов и хозпостроек с полным набором элементов.',
+            keywords: ['домокомплект', 'дом', 'каркас', 'модульный дом'],
+            links: ['Садовые домики', 'Хозблоки', 'Беседки', 'Гаражи'],
+        },
+        {
+            icon: 'fa-spray-can',
+            title: 'Герметики и пены',
+            slug: 'germetiki-i-peny',
+            image: 'https://placehold.co/150x100/cccccc/969696?text=Пены',
+            description: 'Монтажные пены, герметики и сопутствующие материалы для надежной герметизации швов и стыков.',
+            keywords: ['герметик', 'монтажная пена', 'герметики', 'пены'],
+            links: ['Монтажные пены', 'Герметики', 'Очистители пены', 'Лента герметик'],
+        },
+        {
+            icon: 'fa-leaf',
+            title: 'Пароизоляция',
+            slug: 'paroizolyaciya',
+            image: 'https://placehold.co/150x100/cccccc/969696?text=Пленки',
+            description: 'Пленки и мембраны для защиты утеплителя и конструкций от влаги и конденсата.',
+            keywords: ['пароизоляц', 'паробарьер', 'мембран'],
+            links: ['Паро-ветрозащитные пленки', 'Диффузионные мембраны'],
+        },
+        {
+            icon: 'fa-flask',
+            title: 'Строительная химия',
+            slug: 'stroitelnaia-himiya',
+            image: 'https://placehold.co/150x100/cccccc/969696?text=Химия',
+            description: 'Составы для защиты и обслуживания конструкций: антисептики, отбеливатели, огнебиозащита.',
+            keywords: ['строительная хим', 'антисепт', 'огнебиозащ', 'химия'],
+            links: ['Антисептики для древесины', 'Отбеливатели для древесины', 'Огнебиозащита', 'Удалители высолов'],
+        },
     ],
     checkoutState: {
         customerType: 'physical',
@@ -357,8 +459,10 @@ function persistProducts(products) {
     }
 }
 
-function navigateToRoute(view, { replace = false } = {}) {
-    const hash = getHashForView(view);
+function navigateToRoute(view, { replace = false, categorySlug = null } = {}) {
+    const hash = view === 'category'
+        ? buildCategoryHash(categorySlug || appState.selectedCategorySlug)
+        : getHashForView(view);
     if (!hash) return;
     if (replace) {
         updateHash(hash, { replace: true });
@@ -469,6 +573,21 @@ function applyInitialRoute() {
         return;
     }
 
+    if (normalizedSegment.startsWith('category/')) {
+        const slugPart = hashSegment.slice(hashSegment.indexOf('/') + 1);
+        const slug = decodeURIComponent(slugPart || '');
+        const category = findCategoryBySlug(slug);
+        if (category) {
+            setView('category', { skipHistory: true, replaceHistory: true, categorySlug: category.slug });
+            updateHash(buildCategoryHash(category.slug), { replace: true });
+            return;
+        }
+        console.warn('[ROUTER:SKIP]', slug || slugPart, 'Категория не найдена, возврат к каталогу');
+        setView('catalog', { skipHistory: true, replaceHistory: true });
+        updateHash(getHashForView('catalog'), { replace: true });
+        return;
+    }
+
     const { view, matched } = getViewFromSegment(normalizedSegment);
     if (!matched && normalizedSegment) {
         console.warn('[ROUTER:SKIP]', hashSegment, 'Неизвестный маршрут, переход на главную');
@@ -492,6 +611,20 @@ function handleHashChange() {
             return;
         }
         console.warn('[ROUTER:SKIP]', slug, 'Slug не найден при hashchange, возврат в каталог');
+        updateHash(getHashForView('catalog'), { replace: true });
+        setView('catalog', { skipHistory: true, replaceHistory: true });
+        return;
+    }
+
+    if (normalizedSegment.startsWith('category/')) {
+        const slugPart = hashSegment.slice(hashSegment.indexOf('/') + 1);
+        const slug = decodeURIComponent(slugPart || '');
+        const category = findCategoryBySlug(slug);
+        if (category) {
+            setView('category', { skipHistory: true, replaceHistory: true, categorySlug: category.slug });
+            return;
+        }
+        console.warn('[ROUTER:SKIP]', slug || slugPart, 'Категория не найдена при hashchange, возврат к каталогу');
         updateHash(getHashForView('catalog'), { replace: true });
         setView('catalog', { skipHistory: true, replaceHistory: true });
         return;
@@ -530,6 +663,14 @@ function setView(newView, options = {}) {
         isCatalogMenuOpen: false,
     };
 
+    if (newView === 'category') {
+        const categorySlug = options.categorySlug || appState.selectedCategorySlug || null;
+        statePatch.selectedCategorySlug = categorySlug;
+        statePatch.searchTerm = '';
+    } else if (!options.preserveCategory) {
+        statePatch.selectedCategorySlug = null;
+    }
+
     if (options.selectedProductId !== undefined) {
         statePatch.selectedProductId = options.selectedProductId;
     } else if (!options.preserveProduct) {
@@ -542,7 +683,11 @@ function setView(newView, options = {}) {
 
     setState(statePatch, () => {
         if (newView !== 'details' && !options.skipHistory) {
-            navigateToRoute(newView, { replace: options.replaceHistory });
+            const navigationOptions = { replace: options.replaceHistory };
+            if (newView === 'category') {
+                navigationOptions.categorySlug = statePatch.selectedCategorySlug || appState.selectedCategorySlug;
+            }
+            navigateToRoute(newView, navigationOptions);
         }
     });
 }
@@ -595,9 +740,19 @@ function setCatalogMenu(isOpen) {
 }
 
 // --- Функции для оформления заказа и поиска ---
-function handleCategoryClick(categoryName) {
-    appState.searchTerm = categoryName; // Устанавливаем поисковый запрос равным категории
-    setView('catalog');
+function handleCategoryClick(categorySlug) {
+    const category = findCategoryBySlug(categorySlug);
+    if (!category) {
+        console.warn('[CATEGORY:SKIP]', categorySlug, 'Категория не найдена, используем поиск по каталогу');
+        const fallbackTerm = String(categorySlug || '').replace(/[-_]+/g, ' ').trim();
+        handleSearch(fallbackTerm || categorySlug);
+        return;
+    }
+    setView('category', { categorySlug: category.slug });
+}
+
+function handleSubcategorySearch(term) {
+    handleSearch(term);
 }
 
 function handleSearch(term) {
@@ -610,8 +765,15 @@ function handleSearch(term) {
 }
 
 function setOnlyWithPrice(isChecked) {
-    appState.onlyWithPrice = Boolean(isChecked);
-    renderProductGridOnly();
+    const newValue = Boolean(isChecked);
+    if (appState.onlyWithPrice === newValue) return;
+    if (appState.view === 'catalog') {
+        appState.onlyWithPrice = newValue;
+        saveState();
+        renderProductGridOnly();
+    } else {
+        setState({ onlyWithPrice: newValue });
+    }
 }
 
 function handleCheckoutChange(field, value) {
@@ -720,6 +882,16 @@ function getProductPriceLabel(product) {
     return formatCurrency(product.price);
 }
 
+function formatProductCount(count) {
+    const number = Math.abs(Number(count) || 0);
+    const lastTwo = number % 100;
+    const last = number % 10;
+    if (lastTwo > 10 && lastTwo < 20) return `${count} товаров`;
+    if (last > 1 && last < 5) return `${count} товара`;
+    if (last === 1) return `${count} товар`;
+    return `${count} товаров`;
+}
+
 function calculateTotalCost() {
     return Object.values(appState.cartItems).reduce((sum, item) => {
         if (!item || typeof item.price !== 'number' || Number.isNaN(item.price)) return sum;
@@ -813,6 +985,45 @@ function handleBulkImport(jsonString) {
 }
 
 
+function findCategoryBySlug(slug) {
+    if (!slug) return null;
+    const normalizedSlug = String(slug).trim().toLowerCase();
+    return appState.catalogCategories.find(cat => String(cat.slug || '').toLowerCase() === normalizedSlug) || null;
+}
+
+function getCategoryKeywords(category) {
+    if (!category) return [];
+    const keywordSources = [
+        category.title,
+        ...(Array.isArray(category.links) ? category.links : []),
+        ...(Array.isArray(category.keywords) ? category.keywords : []),
+    ];
+    return keywordSources
+        .map(keyword => String(keyword || '').trim().toLowerCase())
+        .filter(Boolean);
+}
+
+function getProductsForCategory(category) {
+    if (!category) return [];
+    const keywords = getCategoryKeywords(category);
+    if (!keywords.length) return [];
+    const seenIds = new Set();
+    const matched = appState.products.filter(product => {
+        const productId = String(product.id || '');
+        if (seenIds.has(productId)) return false;
+        const productCategory = String(product.category || '').toLowerCase().replace(/\\+/g, ' ');
+        const productName = String(product.name || '').toLowerCase();
+        const matches = keywords.some(keyword => productCategory.includes(keyword) || productName.includes(keyword));
+        if (matches) {
+            seenIds.add(productId);
+            return true;
+        }
+        return false;
+    });
+    return appState.onlyWithPrice ? matched.filter(product => product.hasPrice) : matched;
+}
+
+
 // --- Компоненты Рендеринга ---
 
 function renderCatalogDropdown() {
@@ -820,15 +1031,82 @@ function renderCatalogDropdown() {
         <div onmouseenter="setCatalogMenu(true)" onmouseleave="setCatalogMenu(false)" class="absolute top-full left-0 w-max max-w-7xl bg-white text-gray-700 shadow-2xl rounded-b-lg p-8 grid grid-cols-4 gap-x-12 gap-y-6 z-50">
             ${appState.catalogCategories.map(cat => `
                 <div class="space-y-3">
-                    <h3 class="font-bold text-md flex items-center gap-3 cursor-pointer" onclick="handleCategoryClick('${cat.title}')">
+                    <h3 class="font-bold text-md flex items-center gap-3 cursor-pointer" onclick="handleCategoryClick('${cat.slug}')">
                         <i class="fas ${cat.icon} text-[#fcc521] w-5 text-center"></i>
-                        <span>${cat.title}</span>
+                        <span>${escapeHtml(cat.title)}</span>
                     </h3>
                     <ul class="space-y-2 text-sm">
-                        ${cat.links.map(link => `<li><a href="#" onclick="event.preventDefault(); handleCategoryClick('${link}')" class="hover:text-[#fcc521] hover:underline">${link}</a></li>`).join('')}
+                        ${cat.links.map(link => `<li><a href="#" onclick="event.preventDefault(); handleSubcategorySearch(${JSON.stringify(link)})" class="hover:text-[#fcc521] hover:underline">${escapeHtml(link)}</a></li>`).join('')}
                     </ul>
                 </div>
             `).join('')}
+        </div>
+    `;
+}
+
+function renderCategoryPage(slug) {
+    const category = findCategoryBySlug(slug);
+    if (!category) {
+        const fallbackContent = `<p>Запрошенная категория недоступна. Вернитесь в <a href="${getHashForView('catalog')}" class="text-yellow-600 hover:underline">каталог</a> и выберите другой раздел.</p>`;
+        return renderStaticPage('Категория не найдена', fallbackContent);
+    }
+
+    const categoryTitle = escapeHtml(category.title);
+    const description = escapeHtml(category.description || '');
+    const catalogHash = getHashForView('catalog');
+    const homeHash = getHashForView('home');
+    const products = getProductsForCategory(category);
+    const productCountLabel = formatProductCount(products.length);
+    const linksHtml = (category.links || []).slice(0, 12)
+        .map(link => `<span class="px-3 py-1 bg-yellow-100 text-yellow-700 rounded-full text-sm">${escapeHtml(link)}</span>`)
+        .join('');
+    const productsHtml = products.length
+        ? products.map(renderProductCard).join('')
+        : `<p class="col-span-full text-center text-gray-500 py-10">Товары этой категории скоро появятся в каталоге.</p>`;
+
+    return `
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10 space-y-10">
+            <nav class="text-sm text-gray-500 flex items-center gap-2">
+                <a href="${homeHash}" class="hover:text-[#fcc521]">Главная</a>
+                <span>/</span>
+                <a href="${catalogHash}" class="hover:text-[#fcc521]">Каталог</a>
+                <span>/</span>
+                <span class="text-gray-700">${categoryTitle}</span>
+            </nav>
+
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-8 items-start">
+                <div class="lg:col-span-2">
+                    <h1 class="text-4xl font-bold text-gray-800 mb-6">${categoryTitle}</h1>
+                    ${description ? `<p class="text-lg text-gray-600 leading-relaxed mb-6">${description}</p>` : ''}
+                    ${linksHtml ? `<div class="flex flex-wrap gap-2">${linksHtml}</div>` : ''}
+                </div>
+                <aside class="bg-white rounded-lg shadow-md overflow-hidden">
+                    <img src="${category.image}" alt="${categoryTitle}" class="w-full h-48 object-cover"/>
+                    <div class="p-6 space-y-4">
+                        <p class="text-gray-600 text-sm leading-relaxed">Подберём оптимальное решение, рассчитаем объем материалов и организуем доставку на объект.</p>
+                        <button onclick="setView('catalog')" class="inline-flex items-center gap-2 px-4 py-2 bg-[#fcc521] text-gray-900 font-semibold rounded-md shadow hover:bg-yellow-400 transition-colors">
+                            <i class="fas fa-list"></i>
+                            <span>Вернуться в общий каталог</span>
+                        </button>
+                    </div>
+                </aside>
+            </div>
+
+            <section class="bg-white rounded-lg shadow-md p-6">
+                <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-6">
+                    <div>
+                        <h2 class="text-2xl font-bold text-gray-800">Товары категории</h2>
+                        <p class="text-sm text-gray-500">${productCountLabel}</p>
+                    </div>
+                    <button onclick="setOnlyWithPrice(!appState.onlyWithPrice)" class="self-start md:self-auto inline-flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-md text-sm text-gray-700 hover:border-yellow-400 hover:text-yellow-600 transition-colors">
+                        <i class="fas fa-ruble-sign"></i>
+                        <span>${appState.onlyWithPrice ? 'Показать все предложения' : 'Только товары с ценой'}</span>
+                    </button>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-6">
+                    ${productsHtml}
+                </div>
+            </section>
         </div>
     `;
 }
@@ -1327,9 +1605,9 @@ function renderCatalogPage() {
                 <ul class="space-y-2 bg-white p-4 rounded-lg shadow-md">
                     ${appState.catalogCategories.map(cat => `
                         <li>
-                            <a href="#" onclick="event.preventDefault(); handleCategoryClick('${cat.title}')" class="flex items-center p-2 text-gray-700 rounded-lg hover:bg-gray-100 hover:text-[#fcc521]">
+                            <a href="#" onclick="event.preventDefault(); handleCategoryClick('${cat.slug}')" class="flex items-center p-2 text-gray-700 rounded-lg hover:bg-gray-100 hover:text-[#fcc521]">
                                 <i class="fas ${cat.icon} w-6 text-center"></i>
-                                <span class="ml-3">${cat.title}</span>
+                                <span class="ml-3">${escapeHtml(cat.title)}</span>
                             </a>
                         </li>
                     `).join('')}
@@ -1339,12 +1617,12 @@ function renderCatalogPage() {
                  <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
                     ${appState.catalogCategories.map(cat => `
                         <div class="bg-white p-4 rounded-lg shadow-md flex gap-4">
-                            <img src="${cat.image}" alt="${cat.title}" class="w-24 h-24 object-cover rounded-md"/>
+                            <img src="${cat.image}" alt="${escapeHtml(cat.title)}" class="w-24 h-24 object-cover rounded-md"/>
                             <div>
-                                <h3 class="font-bold text-lg cursor-pointer" onclick="handleCategoryClick('${cat.title}')">${cat.title}</h3>
+                                <h3 class="font-bold text-lg cursor-pointer" onclick="handleCategoryClick('${cat.slug}')">${escapeHtml(cat.title)}</h3>
                                 <ul class="text-sm mt-2 space-y-1">
-                                    ${cat.links.slice(0, 5).map(link => `<li><a href="#" onclick="event.preventDefault(); handleCategoryClick('${link}')" class="hover:text-[#fcc521] hover:underline">${link}</a></li>`).join('')}
-                                    ${cat.links.length > 5 ? `<li><a href="#" onclick="event.preventDefault(); handleCategoryClick('${cat.title}')" class="text-yellow-600 hover:underline">Все товары...</a></li>` : ''}
+                                    ${cat.links.slice(0, 5).map(link => `<li><a href="#" onclick="event.preventDefault(); handleSubcategorySearch(${JSON.stringify(link)})" class="hover:text-[#fcc521] hover:underline">${escapeHtml(link)}</a></li>`).join('')}
+                                    ${cat.links.length > 5 ? `<li><a href="#" onclick="event.preventDefault(); handleCategoryClick('${cat.slug}')" class="text-yellow-600 hover:underline">Все товары...</a></li>` : ''}
                                 </ul>
                             </div>
                         </div>
@@ -1628,6 +1906,7 @@ function render() {
 
     let contentHtml = '';
     switch (appState.view) {
+        case 'category': contentHtml = renderCategoryPage(appState.selectedCategorySlug); break;
         case 'catalog': contentHtml = renderProductList(); break;
         case 'cart': contentHtml = renderCartView(); break;
         case 'details': contentHtml = renderProductDetails(); break;
@@ -1666,6 +1945,7 @@ window.toggleMenu = toggleMenu;
 window.setActiveSlide = setActiveSlide;
 window.setCatalogMenu = setCatalogMenu;
 window.handleCategoryClick = handleCategoryClick;
+window.handleSubcategorySearch = handleSubcategorySearch;
 window.handlePlaceOrder = handlePlaceOrder;
 window.handleCheckoutChange = handleCheckoutChange;
 window.handleSearch = handleSearch;
