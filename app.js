@@ -8,17 +8,58 @@ const GEMINI_API_KEY = ""; // Вставьте ваш API-ключ Gemini
 const LOGO_URL = 'https://i.imgur.com/RXyoozd.png';
 const PLACEHOLDER_IMAGE = 'https://placehold.co/600x400/e2e8f0/475569?text=No+Image';
 const VIEW_ROUTES = {
-    home: '/',
-    catalog: '/catalog',
-    cart: '/cart',
-    checkout: '/checkout',
-    admin: '/admin',
-    'online-calc': '/online-calc',
-    payment: '/payment',
-    delivery: '/delivery',
-    about: '/about',
-    contacts: '/contacts',
+    home: '',
+    catalog: 'catalog',
+    cart: 'cart',
+    checkout: 'checkout',
+    admin: 'admin',
+    'online-calc': 'online-calc',
+    payment: 'payment',
+    delivery: 'delivery',
+    about: 'about',
+    contacts: 'contacts',
 };
+
+function getHashForView(view) {
+    const segment = VIEW_ROUTES[view] ?? '';
+    return segment ? `#/${segment}` : '#/';
+}
+
+function buildProductHash(slug) {
+    const safeSlug = slug ? encodeURIComponent(slug) : '';
+    return safeSlug ? `#/product/${safeSlug}` : '#/';
+}
+
+function getCurrentHashSegment() {
+    const hash = window.location.hash || '';
+    return hash.replace(/^#\/?/, '').replace(/\/+$/, '');
+}
+
+function getViewFromSegment(segment) {
+    const normalized = (segment || '').toLowerCase();
+    if (!normalized) {
+        return { view: 'home', matched: true };
+    }
+    for (const [view, route] of Object.entries(VIEW_ROUTES)) {
+        if (route === normalized) {
+            return { view, matched: true };
+        }
+    }
+    return { view: 'home', matched: false };
+}
+
+function updateHash(targetHash, { replace = false } = {}) {
+    const normalizedHash = targetHash || '#/';
+    if (replace) {
+        const { pathname, search } = window.location;
+        history.replaceState(null, '', `${pathname}${search}${normalizedHash}`);
+        return;
+    }
+    if (window.location.hash === normalizedHash) {
+        return;
+    }
+    window.location.hash = normalizedHash;
+}
 
 // --- Нормализация каталога и безопасность контента ---
 const CYRILLIC_MAP = {
@@ -317,17 +358,14 @@ function persistProducts(products) {
 }
 
 function navigateToRoute(view, { replace = false } = {}) {
-    const path = VIEW_ROUTES[view];
-    if (!path) return;
-    const statePayload = { view, productId: appState.selectedProductId };
+    const hash = getHashForView(view);
+    if (!hash) return;
     if (replace) {
-        history.replaceState(statePayload, '', path);
+        updateHash(hash, { replace: true });
         return;
     }
-    if (window.location.pathname === path) {
-        history.replaceState(statePayload, '', path);
-    } else {
-        history.pushState(statePayload, '', path);
+    if (window.location.hash !== hash) {
+        updateHash(hash);
     }
 }
 
@@ -415,56 +453,59 @@ function saveState() {
 }
 
 function applyInitialRoute() {
-    const path = window.location.pathname;
-    const productMatch = path.match(/^\/product\/([^/]+)$/);
-    if (productMatch) {
-        const slug = decodeURIComponent(productMatch[1]);
+    const hashSegment = getCurrentHashSegment();
+    const normalizedSegment = hashSegment.toLowerCase();
+    if (normalizedSegment.startsWith('product/')) {
+        const slug = decodeURIComponent(hashSegment.slice(hashSegment.indexOf('/') + 1));
         const product = appState.products.find(p => p.slug === slug);
         if (product) {
-            appState.selectedProductId = product.id;
-            appState.view = 'details';
-            appState.lastViewBeforeDetails = 'catalog';
-            history.replaceState({ view: 'details', productId: product.id }, '', `/product/${product.slug}`);
+            showDetails(product.id, { skipHistory: true, lastViewOverride: 'catalog' });
+            updateHash(buildProductHash(product.slug), { replace: true });
             return;
         }
-        console.warn('[CATALOG:SKIP]', slug, 'Товар по указанному slug не найден, переход к каталогу');
+        console.warn('[ROUTER:SKIP]', slug, 'Товар по указанному slug не найден, переход к каталогу');
+        setView('catalog', { skipHistory: true, replaceHistory: true });
+        updateHash(getHashForView('catalog'), { replace: true });
+        return;
     }
 
-    const matchedView = Object.entries(VIEW_ROUTES).find(([, route]) => route === path);
-    if (matchedView) {
-        const [view] = matchedView;
-        appState.view = view;
-        appState.lastViewBeforeDetails = view;
-        history.replaceState({ view }, '', path);
-    } else {
-        appState.view = 'home';
-        appState.lastViewBeforeDetails = 'catalog';
-        history.replaceState({ view: 'home' }, '', VIEW_ROUTES.home);
+    const { view, matched } = getViewFromSegment(normalizedSegment);
+    if (!matched && normalizedSegment) {
+        console.warn('[ROUTER:SKIP]', hashSegment, 'Неизвестный маршрут, переход на главную');
+        setView('home', { skipHistory: true, replaceHistory: true });
+        updateHash(getHashForView('home'), { replace: true });
+        return;
     }
+
+    setView(view, { skipHistory: true, replaceHistory: true });
+    updateHash(getHashForView(view), { replace: true });
 }
 
-function handlePopState() {
-    const path = window.location.pathname;
-    const productMatch = path.match(/^\/product\/([^/]+)$/);
-    if (productMatch) {
-        const slug = decodeURIComponent(productMatch[1]);
+function handleHashChange() {
+    const hashSegment = getCurrentHashSegment();
+    const normalizedSegment = hashSegment.toLowerCase();
+    if (normalizedSegment.startsWith('product/')) {
+        const slug = decodeURIComponent(hashSegment.slice(hashSegment.indexOf('/') + 1));
         const product = appState.products.find(p => p.slug === slug);
         if (product) {
             showDetails(product.id, { skipHistory: true });
             return;
         }
-        console.warn('[CATALOG:SKIP]', slug, 'Slug не найден при popstate, возврат в каталог');
+        console.warn('[ROUTER:SKIP]', slug, 'Slug не найден при hashchange, возврат в каталог');
+        updateHash(getHashForView('catalog'), { replace: true });
         setView('catalog', { skipHistory: true, replaceHistory: true });
         return;
     }
 
-    const matchedView = Object.entries(VIEW_ROUTES).find(([, route]) => route === path);
-    if (matchedView) {
-        const [view] = matchedView;
-        setView(view, { skipHistory: true, replaceHistory: true });
-    } else {
+    const { view, matched } = getViewFromSegment(normalizedSegment);
+    if (!matched && normalizedSegment) {
+        console.warn('[ROUTER:SKIP]', hashSegment, 'Неизвестный маршрут при hashchange, переход на главную');
+        updateHash(getHashForView('home'), { replace: true });
         setView('home', { skipHistory: true, replaceHistory: true });
+        return;
     }
+
+    setView(view, { skipHistory: true, replaceHistory: true });
 }
 
 
@@ -513,18 +554,19 @@ function showDetails(productId, options = {}) {
         return;
     }
 
-    if (appState.view !== 'details') {
+    if (Object.prototype.hasOwnProperty.call(options, 'lastViewOverride')) {
+        appState.lastViewBeforeDetails = options.lastViewOverride;
+    } else if (appState.view !== 'details') {
         appState.lastViewBeforeDetails = appState.view;
     }
 
-    const targetUrl = `/product/${product.slug}`;
-    const historyState = { view: 'details', productId: product.id };
-    if (options.skipHistory) {
-        history.replaceState(historyState, '', targetUrl);
-    } else if (window.location.pathname === targetUrl) {
-        history.replaceState(historyState, '', targetUrl);
-    } else {
-        history.pushState(historyState, '', targetUrl);
+    if (!options.skipHistory) {
+        const targetHash = buildProductHash(product.slug);
+        if (options.replaceHistory) {
+            updateHash(targetHash, { replace: true });
+        } else {
+            updateHash(targetHash);
+        }
     }
 
     setState({ view: 'details', selectedProductId: product.id }, options.callback || null);
@@ -1633,7 +1675,7 @@ window.onload = () => {
     loadState();
     applyInitialRoute();
     render();
-    window.addEventListener('popstate', handlePopState);
+    window.addEventListener('hashchange', handleHashChange);
     if (appState.view === 'home') {
         startSlider();
     }
