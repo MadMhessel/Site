@@ -1,8 +1,256 @@
 // --- КОНФИГУРАЦИЯ ---
 const APP_ID = 'art-stroy-clone';
+const SCHEMA_VERSION = 1;
+const PRODUCTS_STORAGE_KEY = 'art-stroy-clone_products_v1';
+const CART_STORAGE_KEY = `${APP_ID}_cart`;
 const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=';
 const GEMINI_API_KEY = ""; // Вставьте ваш API-ключ Gemini
 const LOGO_URL = 'https://i.imgur.com/RXyoozd.png';
+const PLACEHOLDER_IMAGE = 'https://placehold.co/600x400/e2e8f0/475569?text=No+Image';
+const VIEW_ROUTES = {
+    home: '/',
+    catalog: '/catalog',
+    cart: '/cart',
+    checkout: '/checkout',
+    admin: '/admin',
+    'online-calc': '/online-calc',
+    payment: '/payment',
+    delivery: '/delivery',
+    about: '/about',
+    contacts: '/contacts',
+};
+
+// --- Нормализация каталога и безопасность контента ---
+const CYRILLIC_MAP = {
+    а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'e', ж: 'zh', з: 'z', и: 'i',
+    й: 'y', к: 'k', л: 'l', м: 'm', н: 'n', о: 'o', п: 'p', р: 'r', с: 's', т: 't',
+    у: 'u', ф: 'f', х: 'h', ц: 'ts', ч: 'ch', ш: 'sh', щ: 'sch', ы: 'y', э: 'e', ю: 'yu',
+    я: 'ya', ь: '', ъ: '',
+};
+
+const ALLOWED_TAGS = new Set(['p', 'ul', 'ol', 'li', 'h2', 'h3', 'strong', 'em', 'br', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'a']);
+const ALLOWED_ATTRIBUTES = {
+    a: ['href', 'title'],
+    td: ['colspan', 'rowspan'],
+    th: ['colspan', 'rowspan'],
+    table: ['summary'],
+};
+
+function slugify(value) {
+    const lower = String(value || '').trim().toLowerCase();
+    if (!lower) return '';
+    let slug = '';
+    for (const char of lower) {
+        if (/[a-z0-9]/.test(char)) {
+            slug += char;
+            continue;
+        }
+        if (CYRILLIC_MAP[char]) {
+            slug += CYRILLIC_MAP[char];
+            continue;
+        }
+        if (/[\s_-]+/.test(char)) {
+            if (!slug.endsWith('-')) slug += '-';
+        }
+    }
+    slug = slug.replace(/-{2,}/g, '-').replace(/^-+|-+$/g, '');
+    return slug;
+}
+
+function ensureUniqueSlug(baseSlug, fallbackSlug, usedSlugs) {
+    const safeBase = baseSlug || fallbackSlug || '';
+    let candidate = safeBase || `product-${Date.now()}`;
+    let counter = 1;
+    while (usedSlugs.has(candidate)) {
+        candidate = `${safeBase}-${counter++}`;
+    }
+    usedSlugs.add(candidate);
+    return candidate;
+}
+
+/**
+ * Санитизирует HTML описаний с белым списком тегов и минимальными классами для таблиц.
+ */
+function sanitizeHtml(html) {
+    if (!html) return '';
+    const doc = document.implementation.createHTMLDocument('');
+    doc.body.innerHTML = html;
+
+    const cleanseNode = (node) => {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+            const tag = node.tagName.toLowerCase();
+            if (!ALLOWED_TAGS.has(tag)) {
+                const fragment = doc.createDocumentFragment();
+                while (node.firstChild) fragment.appendChild(node.firstChild);
+                node.replaceWith(fragment);
+                Array.from(fragment.childNodes).forEach(child => cleanseNode(child));
+                return;
+            }
+
+            [...node.attributes].forEach(attr => {
+                const name = attr.name.toLowerCase();
+                const value = attr.value;
+                if (name.startsWith('on') || name === 'style') {
+                    node.removeAttribute(attr.name);
+                    return;
+                }
+                const allowedForTag = ALLOWED_ATTRIBUTES[tag] || [];
+                if (!allowedForTag.includes(name)) {
+                    node.removeAttribute(attr.name);
+                    return;
+                }
+                if (tag === 'a' && name === 'href') {
+                    const sanitizedHref = value ? value.trim() : '';
+                    if (/^javascript:/i.test(sanitizedHref)) {
+                        node.removeAttribute(attr.name);
+                    }
+                }
+            });
+
+            if (tag === 'a') {
+                if (!node.getAttribute('href')) node.removeAttribute('href');
+                node.setAttribute('rel', 'noopener noreferrer');
+                node.setAttribute('target', '_blank');
+            }
+
+            if (tag === 'table') {
+                node.className = 'block overflow-x-auto whitespace-nowrap border border-gray-200 rounded-lg text-sm min-w-full';
+            }
+
+            if (tag === 'thead') {
+                node.className = 'bg-gray-50';
+            }
+
+            if (tag === 'tbody') {
+                node.className = '';
+            }
+
+            if (tag === 'tr') {
+                node.className = 'border-b border-gray-200';
+            }
+
+            if (tag === 'th' || tag === 'td') {
+                node.className = 'border border-gray-200 px-3 py-2 text-left align-top';
+            }
+        }
+
+        let child = node.firstChild;
+        while (child) {
+            const next = child.nextSibling;
+            cleanseNode(child);
+            child = next;
+        }
+    };
+
+    Array.from(doc.body.childNodes).forEach(child => cleanseNode(child));
+    return doc.body.innerHTML;
+}
+
+/**
+ * Извлекает чистый текст из HTML-описания для полнотекстового поиска.
+ */
+function extractText(html) {
+    if (!html) return '';
+    const temp = document.createElement('div');
+    temp.innerHTML = sanitizeHtml(html);
+    return temp.textContent.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Приводит экспортированный каталог к унифицированной схеме с валидацией и метаданными.
+ */
+function normalizeCatalog(raw = window.FULL_CATALOG) {
+    const source = Array.isArray(raw) ? raw : [];
+    const normalized = [];
+    const usedSlugs = new Set();
+
+    source.forEach((item, index) => {
+        const rawId = item?.id ?? item?.ID ?? item?.sku ?? item?.product_id ?? index;
+        if (rawId === undefined || rawId === null) {
+            console.warn('[CATALOG:SKIP]', 'unknown', 'Нет идентификатора товара');
+            return;
+        }
+        const id = String(rawId).trim();
+        if (!id) {
+            console.warn('[CATALOG:SKIP]', rawId, 'Пустой идентификатор после приведения к строке');
+            return;
+        }
+
+        const name = String(item?.name ?? item?.title ?? '').trim();
+        if (!name) {
+            console.warn('[CATALOG:SKIP]', id, 'Отсутствует название товара');
+            return;
+        }
+
+        const priceValue = item?.price ?? item?.regular_price ?? item?.sale_price ?? null;
+        const numericPrice = priceValue === null || priceValue === undefined
+            ? null
+            : Number(String(priceValue).replace(/\s+/g, '').replace(',', '.'));
+        const hasPrice = Number.isFinite(numericPrice) && numericPrice > 0;
+        const price = hasPrice ? Number(numericPrice) : null;
+
+        let unit = String(item?.unit ?? item?.measurement ?? 'шт').trim();
+        if (!unit || ['null', 'undefined', 'none'].includes(unit.toLowerCase())) unit = 'шт';
+
+        let category = String(item?.category ?? item?.categories ?? '').trim();
+        if (category) {
+            category = category.replace(/\\+$/g, '').trim();
+            if (['null', 'undefined', 'none'].includes(category.toLowerCase())) {
+                category = '';
+            }
+        }
+        if (!category) category = 'Без категории';
+
+        const imageSource = item?.image ?? item?.images?.[0]?.src ?? item?.images?.[0]?.url ?? '';
+        const rawImage = imageSource ? String(imageSource).trim() : '';
+        const image = rawImage && !['null', 'undefined'].includes(rawImage.toLowerCase()) ? rawImage : '';
+
+        let descriptionHtml = String(item?.description ?? item?.descriptionHtml ?? item?.short_description ?? item?.content ?? '').trim();
+        if (['null', 'undefined'].includes(descriptionHtml.toLowerCase())) {
+            descriptionHtml = '';
+        }
+        const descriptionText = extractText(descriptionHtml);
+        const hasTable = /<table[\s>]/i.test(descriptionHtml);
+
+        const providedSlug = item?.slug ? slugify(item.slug) : '';
+        const baseSlug = providedSlug || slugify(name);
+        const fallbackSlug = slugify(id);
+        const slug = ensureUniqueSlug(baseSlug, fallbackSlug, usedSlugs);
+
+        const product = {
+            id,
+            name,
+            price,
+            hasPrice,
+            unit,
+            category,
+            image: image || PLACEHOLDER_IMAGE,
+            descriptionHtml,
+            descriptionText,
+            slug,
+            badges: {},
+        };
+
+        if (!product.hasPrice) {
+            product.badges.noPrice = true;
+        }
+        if (hasTable) {
+            product.badges.hasTable = true;
+        }
+
+        normalized.push(product);
+    });
+
+    return normalized;
+}
+
+function escapeHtmlAttribute(value) {
+    return String(value ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function escapeHtml(value) {
+    return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
 
 // --- Глобальное Состояние ---
 let appState = {
@@ -10,9 +258,11 @@ let appState = {
     cartItems: {},
     view: 'home', // 'home', 'catalog', 'cart', 'checkout', 'admin', 'details', 'online-calc', 'payment', 'delivery', 'about', 'contacts'
     selectedProductId: null,
+    lastViewBeforeDetails: 'catalog',
     message: '',
     searchTerm: '',
     sortBy: 'name-asc',
+    onlyWithPrice: false,
     isMenuOpen: false,
     isCatalogMenuOpen: false,
     activeSlide: 0,
@@ -58,31 +308,163 @@ window.adminState = {
 
 // --- Утилиты ---
 
-function loadState() {
-    const storedProducts = localStorage.getItem(`${APP_ID}_products`);
-    const storedCart = localStorage.getItem(`${APP_ID}_cart`);
+function persistProducts(products) {
+    try {
+        localStorage.setItem(PRODUCTS_STORAGE_KEY, JSON.stringify({ schemaVersion: SCHEMA_VERSION, products }));
+    } catch (error) {
+        console.warn('[CATALOG:SKIP]', 'storage', `Не удалось сохранить каталог: ${error.message}`);
+    }
+}
 
-    // Загружаем товары из глобального каталога, если он есть
-    if (window.FULL_CATALOG && window.FULL_CATALOG.length > 0) {
-        appState.products = window.FULL_CATALOG;
+function navigateToRoute(view, { replace = false } = {}) {
+    const path = VIEW_ROUTES[view];
+    if (!path) return;
+    const statePayload = { view, productId: appState.selectedProductId };
+    if (replace) {
+        history.replaceState(statePayload, '', path);
+        return;
+    }
+    if (window.location.pathname === path) {
+        history.replaceState(statePayload, '', path);
     } else {
-        // Оставляем демо-товары как запасной вариант
-        appState.products = [
-            { id: 'demo-1', name: 'Пеноблок D600 (600x200x300)', price: 350, unit: 'шт', description: 'Легкий и прочный пеноблок.', image: 'https://placehold.co/400x300/4a7a9c/ffffff?text=Пеноблок' }
-        ];
+        history.pushState(statePayload, '', path);
     }
-    
-    // Перезаписываем из localStorage, если там есть сохраненные данные
-    if (storedProducts) {
-        appState.products = JSON.parse(storedProducts);
+}
+
+/**
+ * Загружает товары и корзину, учитывая актуальную схему данных и резервный каталог.
+ */
+function loadState() {
+    let products = [];
+
+    try {
+        const stored = localStorage.getItem(PRODUCTS_STORAGE_KEY);
+        if (stored) {
+            const parsed = JSON.parse(stored);
+            if (parsed?.schemaVersion === SCHEMA_VERSION && Array.isArray(parsed.products)) {
+                const normalizedStored = normalizeCatalog(parsed.products);
+                if (normalizedStored.length > 0) {
+                    products = normalizedStored;
+                }
+            }
+        }
+    } catch (error) {
+        console.warn('[CATALOG:SKIP]', 'storage', `Ошибка чтения каталога из localStorage: ${error.message}`);
     }
 
-    if (storedCart) appState.cartItems = JSON.parse(storedCart);
+    if (!products.length) {
+        const sourceCatalog = Array.isArray(window.FULL_CATALOG) && window.FULL_CATALOG.length
+            ? normalizeCatalog(window.FULL_CATALOG)
+            : [];
+        if (sourceCatalog.length) {
+            products = sourceCatalog;
+        } else {
+            products = normalizeCatalog([
+                {
+                    id: 'demo-1',
+                    name: 'Пеноблок D600 (600x200x300)',
+                    price: 350,
+                    unit: 'шт',
+                    category: 'Демо-товары',
+                    description: 'Легкий и прочный пеноблок.',
+                    image: 'https://placehold.co/400x300/4a7a9c/ffffff?text=Пеноблок',
+                },
+            ]);
+        }
+        persistProducts(products);
+    }
+
+    appState.products = products;
+
+    try {
+        const storedCart = localStorage.getItem(CART_STORAGE_KEY);
+        if (storedCart) {
+            const parsedCart = JSON.parse(storedCart);
+            if (parsedCart && typeof parsedCart === 'object') {
+                const cleanedCart = {};
+                Object.entries(parsedCart).forEach(([key, item]) => {
+                    const product = products.find(p => String(p.id) === String(key));
+                    if (!product || !product.hasPrice) return;
+                    const quantity = Number(item.quantity) || 0;
+                    if (quantity <= 0) return;
+                    cleanedCart[key] = {
+                        id: product.id,
+                        name: product.name,
+                        price: product.price,
+                        unit: product.unit,
+                        quantity,
+                    };
+                });
+                appState.cartItems = cleanedCart;
+            }
+        }
+    } catch (error) {
+        console.warn('[CATALOG:SKIP]', 'cart', `Ошибка чтения корзины: ${error.message}`);
+    }
+
+    persistProducts(appState.products);
 }
 
 function saveState() {
-    localStorage.setItem(`${APP_ID}_products`, JSON.stringify(appState.products));
-    localStorage.setItem(`${APP_ID}_cart`, JSON.stringify(appState.cartItems));
+    persistProducts(appState.products);
+    try {
+        localStorage.setItem(CART_STORAGE_KEY, JSON.stringify(appState.cartItems));
+    } catch (error) {
+        console.warn('[CATALOG:SKIP]', 'cart', `Не удалось сохранить корзину: ${error.message}`);
+    }
+}
+
+function applyInitialRoute() {
+    const path = window.location.pathname;
+    const productMatch = path.match(/^\/product\/([^/]+)$/);
+    if (productMatch) {
+        const slug = decodeURIComponent(productMatch[1]);
+        const product = appState.products.find(p => p.slug === slug);
+        if (product) {
+            appState.selectedProductId = product.id;
+            appState.view = 'details';
+            appState.lastViewBeforeDetails = 'catalog';
+            history.replaceState({ view: 'details', productId: product.id }, '', `/product/${product.slug}`);
+            return;
+        }
+        console.warn('[CATALOG:SKIP]', slug, 'Товар по указанному slug не найден, переход к каталогу');
+    }
+
+    const matchedView = Object.entries(VIEW_ROUTES).find(([, route]) => route === path);
+    if (matchedView) {
+        const [view] = matchedView;
+        appState.view = view;
+        appState.lastViewBeforeDetails = view;
+        history.replaceState({ view }, '', path);
+    } else {
+        appState.view = 'home';
+        appState.lastViewBeforeDetails = 'catalog';
+        history.replaceState({ view: 'home' }, '', VIEW_ROUTES.home);
+    }
+}
+
+function handlePopState() {
+    const path = window.location.pathname;
+    const productMatch = path.match(/^\/product\/([^/]+)$/);
+    if (productMatch) {
+        const slug = decodeURIComponent(productMatch[1]);
+        const product = appState.products.find(p => p.slug === slug);
+        if (product) {
+            showDetails(product.id, { skipHistory: true });
+            return;
+        }
+        console.warn('[CATALOG:SKIP]', slug, 'Slug не найден при popstate, возврат в каталог');
+        setView('catalog', { skipHistory: true, replaceHistory: true });
+        return;
+    }
+
+    const matchedView = Object.entries(VIEW_ROUTES).find(([, route]) => route === path);
+    if (matchedView) {
+        const [view] = matchedView;
+        setView(view, { skipHistory: true, replaceHistory: true });
+    } else {
+        setView('home', { skipHistory: true, replaceHistory: true });
+    }
 }
 
 
@@ -100,12 +482,57 @@ function setMessage(text) {
     setTimeout(() => setState({ message: '' }), 4000);
 }
 
-function setView(newView) {
-    setState({ view: newView, selectedProductId: null, message: '', isCatalogMenuOpen: false });
+function setView(newView, options = {}) {
+    const statePatch = {
+        view: newView,
+        message: '',
+        isCatalogMenuOpen: false,
+    };
+
+    if (options.selectedProductId !== undefined) {
+        statePatch.selectedProductId = options.selectedProductId;
+    } else if (!options.preserveProduct) {
+        statePatch.selectedProductId = null;
+    }
+
+    if (newView !== 'details') {
+        appState.lastViewBeforeDetails = newView;
+    }
+
+    setState(statePatch, () => {
+        if (newView !== 'details' && !options.skipHistory) {
+            navigateToRoute(newView, { replace: options.replaceHistory });
+        }
+    });
 }
 
-function showDetails(productId) {
-    setState({ view: 'details', selectedProductId: productId });
+function showDetails(productId, options = {}) {
+    const product = appState.products.find(p => String(p.id) === String(productId));
+    if (!product) {
+        console.warn('[CATALOG:SKIP]', productId, 'Продукт не найден при открытии карточки');
+        return;
+    }
+
+    if (appState.view !== 'details') {
+        appState.lastViewBeforeDetails = appState.view;
+    }
+
+    const targetUrl = `/product/${product.slug}`;
+    const historyState = { view: 'details', productId: product.id };
+    if (options.skipHistory) {
+        history.replaceState(historyState, '', targetUrl);
+    } else if (window.location.pathname === targetUrl) {
+        history.replaceState(historyState, '', targetUrl);
+    } else {
+        history.pushState(historyState, '', targetUrl);
+    }
+
+    setState({ view: 'details', selectedProductId: product.id }, options.callback || null);
+}
+
+function exitProductDetails() {
+    const targetView = appState.lastViewBeforeDetails || 'catalog';
+    setView(targetView, { replaceHistory: true });
 }
 
 function toggleMenu() {
@@ -138,6 +565,11 @@ function handleSearch(term) {
     } else {
         renderProductGridOnly(); // Только перерисовываем товары, а не всю страницу
     }
+}
+
+function setOnlyWithPrice(isChecked) {
+    appState.onlyWithPrice = Boolean(isChecked);
+    renderProductGridOnly();
 }
 
 function handleCheckoutChange(field, value) {
@@ -178,32 +610,79 @@ function setActiveSlide(index) {
 
 // --- Логика Фильтрации и Сортировки ---
 
+/**
+ * Возвращает список товаров с учётом поиска, фильтра «Только с ценой» и сортировки.
+ */
 function getVisibleProducts() {
-    let filteredProducts = appState.products;
-    if (appState.searchTerm.trim() !== '') {
-        const lowerCaseSearch = appState.searchTerm.toLowerCase();
-        filteredProducts = filteredProducts.filter(p =>
-            p.name.toLowerCase().includes(lowerCaseSearch) ||
-            (p.description && p.description.toLowerCase().includes(lowerCaseSearch)) ||
-            (p.category && p.category.toLowerCase().includes(lowerCaseSearch))
-        );
+    const searchTerm = appState.searchTerm.trim().toLowerCase();
+    let filteredProducts = [...appState.products];
+
+    if (appState.onlyWithPrice) {
+        filteredProducts = filteredProducts.filter(product => product.hasPrice);
     }
+
+    if (searchTerm) {
+        filteredProducts = filteredProducts.filter(product => {
+            const nameMatch = product.name.toLowerCase().includes(searchTerm);
+            const categoryMatch = product.category.toLowerCase().includes(searchTerm);
+            const descriptionMatch = (product.descriptionText || '').toLowerCase().includes(searchTerm);
+            return nameMatch || categoryMatch || descriptionMatch;
+        });
+    }
+
+    const locale = 'ru';
+    const sortedProducts = [...filteredProducts];
+
+    const pushNullPricesToEnd = (a, b) => {
+        if (!a.hasPrice && !b.hasPrice) return a.name.localeCompare(b.name, locale);
+        if (!a.hasPrice) return 1;
+        if (!b.hasPrice) return -1;
+        return 0;
+    };
+
     switch (appState.sortBy) {
-        case 'price-asc': return [...filteredProducts].sort((a, b) => a.price - b.price);
-        case 'price-desc': return [...filteredProducts].sort((a, b) => b.price - a.price);
-        case 'name-asc': return [...filteredProducts].sort((a, b) => a.name.localeCompare(b.name));
-        case 'name-desc': return [...filteredProducts].sort((a, b) => b.name.localeCompare(a.name));
-        default: return filteredProducts;
+        case 'price-asc':
+            sortedProducts.sort((a, b) => {
+                const nullCheck = pushNullPricesToEnd(a, b);
+                if (nullCheck !== 0) return nullCheck;
+                return a.price - b.price || a.name.localeCompare(b.name, locale);
+            });
+            break;
+        case 'price-desc':
+            sortedProducts.sort((a, b) => {
+                const nullCheck = pushNullPricesToEnd(a, b);
+                if (nullCheck !== 0) return nullCheck;
+                return b.price - a.price || a.name.localeCompare(b.name, locale);
+            });
+            break;
+        case 'name-desc':
+            sortedProducts.sort((a, b) => b.name.localeCompare(a.name, locale));
+            break;
+        case 'name-asc':
+        default:
+            sortedProducts.sort((a, b) => a.name.localeCompare(b.name, locale));
+            break;
     }
+
+    return sortedProducts;
 }
 
 // --- Утилиты Расчетов ---
 function formatCurrency(amount) {
-    if (typeof amount !== 'number') return '0 ₽';
+    if (typeof amount !== 'number' || Number.isNaN(amount)) return '0 ₽';
     return amount.toLocaleString('ru-RU', { style: 'currency', currency: 'RUB', minimumFractionDigits: 0 });
 }
+
+function getProductPriceLabel(product) {
+    if (!product?.hasPrice) return 'Цена по запросу';
+    return formatCurrency(product.price);
+}
+
 function calculateTotalCost() {
-    return Object.values(appState.cartItems).reduce((sum, item) => sum + (item.quantity * item.price), 0);
+    return Object.values(appState.cartItems).reduce((sum, item) => {
+        if (!item || typeof item.price !== 'number' || Number.isNaN(item.price)) return sum;
+        return sum + (item.quantity * item.price);
+    }, 0);
 }
 function calculateCartCount() {
     return Object.values(appState.cartItems).reduce((sum, item) => sum + item.quantity, 0);
@@ -213,6 +692,7 @@ function calculateCartCount() {
 function updateCartItemQuantity(productId, change) {
     const product = appState.products.find(p => String(p.id) === String(productId));
     if (!product) { setMessage('Продукт не найден.'); return; }
+    if (!product.hasPrice) { setMessage('Для этого товара требуется запрос цены.'); return; }
     const newCartItems = { ...appState.cartItems };
     const newQuantity = (newCartItems[productId]?.quantity || 0) + change;
     if (newQuantity <= 0) delete newCartItems[productId];
@@ -220,6 +700,9 @@ function updateCartItemQuantity(productId, change) {
     setState({ cartItems: newCartItems });
 }
 function addToCart(productId) {
+    const product = appState.products.find(p => String(p.id) === String(productId));
+    if (!product) { setMessage('Продукт не найден.'); return; }
+    if (!product.hasPrice) { setMessage('Для этого товара требуется запрос цены.'); return; }
     updateCartItemQuantity(productId, 1);
     setMessage("Товар добавлен в корзину!");
 }
@@ -229,9 +712,29 @@ function removeFromCart(productId) {
     setState({ cartItems: newCartItems });
 }
 
+function requestPrice(productId) {
+    const product = appState.products.find(p => String(p.id) === String(productId));
+    if (!product) { setMessage('Продукт не найден.'); return; }
+    setMessage(`Запрос по товару "${product.name}" отправлен. Менеджер свяжется с вами.`);
+}
+
 // --- Функции Админа (без изменений) ---
 async function handleAddProduct(productData) {
-    const newProduct = { id: `prod-${Date.now()}`, ...productData, price: parseFloat(productData.price) || 0 };
+    const rawProduct = {
+        id: productData.id || `prod-${Date.now()}`,
+        name: productData.name,
+        price: productData.price,
+        unit: productData.unit,
+        category: productData.category || 'Без категории',
+        description: productData.description,
+        image: productData.image,
+    };
+    const normalized = normalizeCatalog([rawProduct]);
+    if (!normalized.length) {
+        setMessage('Не удалось добавить продукт: проверьте корректность данных.');
+        return;
+    }
+    const [newProduct] = normalized;
     setState({ products: [...appState.products, newProduct] }, () => setMessage(`Продукт "${newProduct.name}" добавлен.`));
 }
 
@@ -253,9 +756,17 @@ function handleBulkImport(jsonString) {
     try {
         const productsToImport = JSON.parse(jsonString);
         if (!Array.isArray(productsToImport)) throw new Error("Данные должны быть массивом.");
-        const newProducts = productsToImport.map((p, i) => ({ ...p, id: `import-${Date.now()}-${i}`}));
-        setState({ products: [...appState.products, ...newProducts] });
-        setMessage(`Импортировано ${newProducts.length} продуктов.`);
+        const preparedProducts = productsToImport.map((product, index) => ({
+            id: product?.id || `import-${Date.now()}-${index}`,
+            ...product,
+        }));
+        const normalized = normalizeCatalog(preparedProducts);
+        if (!normalized.length) {
+            setMessage('Ни один товар не прошёл нормализацию.');
+            return;
+        }
+        setState({ products: [...appState.products, ...normalized] });
+        setMessage(`Импортировано ${normalized.length} продуктов.`);
     } catch (e) { setMessage(`Ошибка импорта: ${e.message}`); }
 }
 
@@ -815,6 +1326,9 @@ function renderProductGridOnly() {
 }
 
 
+/**
+ * Отрисовывает страницу списка товаров вместе с фильтрами и сортировкой.
+ */
 function renderProductList() {
     const visibleProducts = getVisibleProducts();
 
@@ -825,7 +1339,11 @@ function renderProductList() {
                 <div class="flex flex-col md:flex-row gap-4 items-center">
                      <h2 class="text-2xl font-bold text-gray-800">Все товары</h2>
                     <div class="flex-grow"></div>
-                    <div class="flex-shrink-0">
+                    <div class="flex items-center gap-4">
+                        <label class="flex items-center gap-2 text-sm text-gray-700 bg-white px-3 py-2 rounded-lg shadow-sm">
+                            <input type="checkbox" ${appState.onlyWithPrice ? 'checked' : ''} onchange="setOnlyWithPrice(this.checked)" class="h-4 w-4 text-[#fcc521] border-gray-300 rounded focus:ring-[#fcc521]"/>
+                            <span>Только с ценой</span>
+                        </label>
                         <select onchange="setState({ sortBy: this.value })" class="w-full md:w-auto px-4 py-2 border border-gray-300 rounded-lg bg-white focus:ring-2 focus:ring-[#fcc521] focus:outline-none">
                             <option value="name-asc" ${appState.sortBy === 'name-asc' ? 'selected' : ''}>По названию (А-Я)</option>
                             <option value="name-desc" ${appState.sortBy === 'name-desc' ? 'selected' : ''}>По названию (Я-А)</option>
@@ -835,30 +1353,44 @@ function renderProductList() {
                     </div>
                 </div>
             </div>
-            <div id="product-grid-container" class="grid-container">
+            <div id="product-grid-container" class="grid-container grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-6">
                 ${visibleProducts.length > 0 ? visibleProducts.map(renderProductCard).join('') : `<p class="col-span-full text-center text-gray-500 py-10">Товары не найдены.</p>`}
             </div>
         </div>`;
 }
 
+/**
+ * Рендерит карточку товара в списке с учётом цены, бейджей и безопасного изображения.
+ */
 function renderProductCard(product) {
     const itemInCart = appState.cartItems[product.id];
+    const priceLabel = getProductPriceLabel(product);
+    const unitLabel = product.hasPrice ? `<span class="text-sm font-normal text-gray-500"> / ${escapeHtml(product.unit)}</span>` : '';
+    const titleAttr = escapeHtmlAttribute(product.name);
+    const nameText = escapeHtml(product.name);
+    const categoryText = escapeHtml(product.category);
     return `
         <div class="bg-white rounded-lg shadow-md overflow-hidden transform hover:-translate-y-1 transition-transform duration-300 flex flex-col group border">
             <div class="relative h-48 bg-gray-200 cursor-pointer" onclick="showDetails('${product.id}')">
-                <img src="${product.image}" alt="${product.name}" class="w-full h-full object-cover" onerror="this.src='https://placehold.co/400x300/e2e8f0/94a3b8?text=Ошибка'"/>
+                <img src="${product.image}" alt="${titleAttr}" class="w-full h-full object-cover" onerror="this.onerror=null; this.src='${PLACEHOLDER_IMAGE}'"/>
+                ${product.badges.noPrice ? `<span class="absolute top-3 left-3 bg-amber-500 text-white text-xs font-semibold px-2 py-1 rounded">Цена по запросу</span>` : ''}
             </div>
-            <div class="p-4 flex-grow flex flex-col">
-                <h3 class="text-md font-semibold text-gray-800 mb-2 flex-grow cursor-pointer hover:text-yellow-500" onclick="showDetails('${product.id}')">${product.name}</h3>
-                <div class="flex justify-between items-center mt-auto">
-                    <p class="text-xl font-bold text-gray-900">${formatCurrency(product.price)}<span class="text-sm font-normal text-gray-500"> / ${product.unit}</span></p>
-                     ${!itemInCart ? `
-                        <button onclick="addToCart('${product.id}')" class="bg-[#fcc521] hover:bg-yellow-500 text-gray-800 font-bold px-4 py-2 rounded-md transition-colors duration-200">В корзину</button>` : `
-                        <div class="flex items-center rounded-lg border border-gray-300">
-                            <button onclick="updateCartItemQuantity('${product.id}', -1)" class="px-3 py-1 text-lg hover:bg-gray-100 rounded-l-lg">-</button>
-                            <span class="px-3 font-medium">${itemInCart.quantity}</span>
-                            <button onclick="updateCartItemQuantity('${product.id}', 1)" class="px-3 py-1 text-lg hover:bg-gray-100 rounded-r-lg">+</button>
-                        </div>`}
+            <div class="p-4 flex-grow flex flex-col gap-2">
+                <h3 class="text-md font-semibold text-gray-800 cursor-pointer hover:text-yellow-500" onclick="showDetails('${product.id}')" title="${titleAttr}" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;">
+                    ${nameText}
+                </h3>
+                <p class="text-sm text-gray-500">${categoryText}</p>
+                <p class="text-lg font-bold text-gray-900">${priceLabel}${unitLabel}</p>
+                <div class="mt-auto flex items-center justify-between gap-3">
+                    ${product.hasPrice ? (
+                        !itemInCart
+                            ? `<button onclick="addToCart('${product.id}')" class="bg-[#fcc521] hover:bg-yellow-500 text-gray-800 font-bold px-4 py-2 rounded-md transition-colors duration-200">В корзину</button>`
+                            : `<div class="flex items-center rounded-lg border border-gray-300">
+                                    <button onclick="updateCartItemQuantity('${product.id}', -1)" class="px-3 py-1 text-lg hover:bg-gray-100 rounded-l-lg">-</button>
+                                    <span class="px-3 font-medium">${itemInCart.quantity}</span>
+                                    <button onclick="updateCartItemQuantity('${product.id}', 1)" class="px-3 py-1 text-lg hover:bg-gray-100 rounded-r-lg">+</button>
+                                </div>`
+                    ) : `<button onclick="requestPrice('${product.id}')" class="bg-gray-200 hover:bg-gray-300 text-gray-700 font-semibold px-4 py-2 rounded-md transition-colors duration-200">Запросить цену</button>`}
                 </div>
             </div>
         </div>`;
@@ -875,9 +1407,12 @@ function renderCartView() {
                     <p class="text-xl text-gray-600 mb-4">Ваша корзина пуста</p>
                     <button onclick="setView('catalog')" class="bg-[#fcc521] hover:bg-yellow-500 text-gray-800 font-bold px-6 py-2 rounded-lg transition">Перейти в каталог</button>
                 </div>` : `
-                <div class="space-y-4">${Object.entries(appState.cartItems).map(([productId, item]) => `
+                <div class="space-y-4">${Object.entries(appState.cartItems).map(([productId, item]) => {
+                    const itemName = escapeHtml(item.name);
+                    const itemUnit = escapeHtml(item.unit);
+                    return `
                     <div class="flex flex-col sm:flex-row items-center bg-white p-4 rounded-lg shadow-sm gap-4">
-                        <div class="flex-grow w-full"><h3 class="text-lg font-semibold text-gray-800">${item.name}</h3><p class="text-sm text-gray-500">${formatCurrency(item.price)} / ${item.unit}</p></div>
+                        <div class="flex-grow w-full"><h3 class="text-lg font-semibold text-gray-800">${itemName}</h3><p class="text-sm text-gray-500">${formatCurrency(item.price)} / ${itemUnit}</p></div>
                         <div class="flex items-center gap-4">
                             <div class="flex items-center border border-gray-300 rounded-md">
                                 <button onclick="updateCartItemQuantity('${productId}', -1)" class="px-3 py-1 text-lg hover:bg-gray-100 rounded-l-md">-</button>
@@ -887,7 +1422,7 @@ function renderCartView() {
                             <div class="font-bold text-lg text-gray-800 w-32 text-right">${formatCurrency(item.quantity * item.price)}</div>
                             <button onclick="removeFromCart('${productId}')" class="text-gray-400 hover:text-red-500 transition"><i class="fas fa-trash-alt"></i></button>
                         </div>
-                    </div>`).join('')}
+                    </div>`;}).join('')}
                 </div>
                 <div class="mt-6 p-6 bg-white rounded-lg shadow-md flex justify-between items-center">
                     <span class="text-xl font-bold text-gray-800">Итого:</span>
@@ -898,38 +1433,63 @@ function renderCartView() {
         </div>`;
 }
 
+/**
+ * Отрисовывает карточку товара с безопасным описанием и адаптированными действиями.
+ */
 function renderProductDetails() {
     const product = appState.products.find(p => String(p.id) === String(appState.selectedProductId));
     if (!product) return `<div class="p-10 text-center text-red-600">Продукт не найден.</div>`;
     const itemInCart = appState.cartItems[product.id];
+    const sanitizedDescription = sanitizeHtml(product.descriptionHtml);
+    const descriptionBlock = sanitizedDescription
+        ? `<div class="prose max-w-none space-y-4 product-description">${sanitizedDescription}</div>`
+        : '<p class="text-gray-500">Описание временно недоступно.</p>';
+    const priceLabel = getProductPriceLabel(product);
+    const unitText = escapeHtml(product.unit);
+    const unitLabel = product.hasPrice ? `<span class="text-lg font-normal text-gray-500">/ ${unitText}</span>` : '';
+    const badges = [
+        product.badges?.noPrice ? '<span class="bg-amber-500 text-white text-xs font-semibold px-3 py-1 rounded-full">Цена по запросу</span>' : '',
+        product.badges?.hasTable ? '<span class="bg-blue-100 text-blue-700 text-xs font-semibold px-3 py-1 rounded-full">Таблица в описании</span>' : '',
+    ].filter(Boolean).join(' ');
+    const titleAttr = escapeHtmlAttribute(product.name);
+    const nameText = escapeHtml(product.name);
+    const categoryText = escapeHtml(product.category);
+
     return `
         <div class="max-w-5xl mx-auto p-4 sm:p-6 bg-white my-8 rounded-lg shadow-xl">
-            <button onclick="setView('catalog')" class="mb-6 text-gray-600 hover:text-[#fcc521] hover:underline flex items-center transition">
-                <i class="fas fa-arrow-left mr-2"></i> Назад в Каталог
+            <button onclick="exitProductDetails()" class="mb-6 text-gray-600 hover:text-[#fcc521] hover:underline flex items-center transition">
+                <i class="fas fa-arrow-left mr-2"></i> Назад в каталог
             </button>
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
                 <div class="bg-gray-100 rounded-lg flex items-center justify-center p-4">
-                    <img src="${product.image}" alt="${product.name}" class="max-h-96 w-auto object-contain" onerror="this.src='https://placehold.co/800x600/e2e8f0/94a3b8?text=Ошибка'"/>
+                    <img src="${product.image}" alt="${titleAttr}" class="max-h-96 w-auto object-contain" onerror="this.onerror=null; this.src='${PLACEHOLDER_IMAGE}'"/>
                 </div>
-                <div>
-                    <h2 class="text-3xl font-bold text-gray-900 mb-3">${product.name}</h2>
-                    <p class="text-3xl font-bold text-gray-800 mb-6">${formatCurrency(product.price)} <span class="text-lg font-normal text-gray-500">/ ${product.unit}</span></p>
-                    <h3 class="text-lg font-semibold text-gray-800 border-b pb-2 mb-3">Описание</h3>
-                    <p class="text-gray-600 leading-relaxed">${(product.description || '').replace(/\n/g, '<br>')}</p>
-                    <div class="mt-8">
-                         ${!itemInCart ? `
-                            <button onclick="addToCart('${product.id}')" class="w-full sm:w-auto bg-[#fcc521] hover:bg-yellow-500 text-gray-800 font-bold px-8 py-3 rounded-lg text-lg transition shadow-lg">
-                                <i class="fas fa-cart-plus mr-2"></i>Добавить в корзину
-                            </button>` : `
-                            <div class="flex items-center space-x-4">
-                                <p class="font-medium">В корзине:</p>
-                                <div class="flex items-center rounded-lg border-2 border-[#fcc521] text-lg">
-                                    <button onclick="updateCartItemQuantity('${product.id}', -1)" class="px-4 py-2 hover:bg-gray-100 rounded-l-md">-</button>
-                                    <span class="px-5 font-bold">${itemInCart.quantity} ${product.unit}</span>
-                                    <button onclick="updateCartItemQuantity('${product.id}', 1)" class="px-4 py-2 hover:bg-gray-100 rounded-r-md">+</button>
-                                </div>
-                                <button onclick="removeFromCart('${product.id}')" class="text-red-500 hover:underline">Удалить</button>
-                            </div>`}
+                <div class="space-y-4">
+                    <div class="space-y-2">
+                        <h2 class="text-3xl font-bold text-gray-900">${nameText}</h2>
+                        <p class="text-sm text-gray-500">Категория: ${categoryText}</p>
+                        ${badges ? `<div class="flex flex-wrap gap-2">${badges}</div>` : ''}
+                    </div>
+                    <p class="text-3xl font-bold text-gray-800">${priceLabel}${unitLabel}</p>
+                    <div class="space-y-3">
+                        <h3 class="text-lg font-semibold text-gray-800 border-b pb-2">Описание</h3>
+                        ${descriptionBlock}
+                    </div>
+                    <div class="pt-4">
+                        ${product.hasPrice ? (
+                            !itemInCart
+                                ? `<button onclick="addToCart('${product.id}')" class="w-full sm:w-auto bg-[#fcc521] hover:bg-yellow-500 text-gray-800 font-bold px-8 py-3 rounded-lg text-lg transition shadow-lg">
+                                        <i class="fas fa-cart-plus mr-2"></i>Добавить в корзину
+                                   </button>`
+                                : `<div class="flex flex-col sm:flex-row sm:items-center sm:space-x-4 space-y-4 sm:space-y-0">
+                                        <div class="flex items-center rounded-lg border-2 border-[#fcc521] text-lg">
+                                            <button onclick="updateCartItemQuantity('${product.id}', -1)" class="px-4 py-2 hover:bg-gray-100 rounded-l-md">-</button>
+                                            <span class="px-5 font-bold">${itemInCart.quantity} ${unitText}</span>
+                                            <button onclick="updateCartItemQuantity('${product.id}', 1)" class="px-4 py-2 hover:bg-gray-100 rounded-r-md">+</button>
+                                        </div>
+                                        <button onclick="removeFromCart('${product.id}')" class="text-red-500 hover:underline">Удалить из корзины</button>
+                                   </div>`
+                        ) : `<button onclick="requestPrice('${product.id}')" class="w-full sm:w-auto bg-gray-200 hover:bg-gray-300 text-gray-700 font-semibold px-8 py-3 rounded-lg text-lg transition">Запросить цену</button>`}
                     </div>
                 </div>
             </div>
@@ -964,7 +1524,7 @@ function renderAdminPanel() {
     document.getElementById('singleProductForm').onsubmit = (e) => {
         e.preventDefault();
         handleAddProduct({ name: window.adminState.productName, price: window.adminState.productPrice, unit: window.adminState.productUnit, description: window.adminState.productDescription, image: window.adminState.productImage });
-        window.adminState = {...window.adminState, productName: '', productPrice: '', productUnit: 'шт', description: '', productImage: 'https://placehold.co/400x300/e2e8f0/94a3b8?text=Стройматериал'};
+        window.adminState = {...window.adminState, productName: '', productPrice: '', productUnit: 'шт', productDescription: '', productImage: 'https://placehold.co/400x300/e2e8f0/94a3b8?text=Стройматериал'};
         renderAdminContent();
     };
 }
@@ -975,7 +1535,8 @@ function renderAdminContent() {
 
 function renderMessageModal() {
     if (!appState.message) return '';
-    return `<div class="fixed top-5 right-5 bg-gray-800 text-white py-3 px-5 rounded-lg shadow-xl z-50 animate-fade-in-down"><p><i class="fas fa-check-circle mr-2"></i>${appState.message}</p></div>`;
+    const safeMessage = escapeHtml(appState.message);
+    return `<div class="fixed top-5 right-5 bg-gray-800 text-white py-3 px-5 rounded-lg shadow-xl z-50 animate-fade-in-down"><p><i class="fas fa-check-circle mr-2"></i>${safeMessage}</p></div>`;
 }
 
 function renderFooter() {
@@ -1054,6 +1615,8 @@ window.showDetails = showDetails;
 window.addToCart = addToCart;
 window.updateCartItemQuantity = updateCartItemQuantity;
 window.removeFromCart = removeFromCart;
+window.requestPrice = requestPrice;
+window.exitProductDetails = exitProductDetails;
 window.handleBulkImport = handleBulkImport;
 window.handleFileChange = handleFileChange;
 window.setState = setState;
@@ -1064,10 +1627,13 @@ window.handleCategoryClick = handleCategoryClick;
 window.handlePlaceOrder = handlePlaceOrder;
 window.handleCheckoutChange = handleCheckoutChange;
 window.handleSearch = handleSearch;
+window.setOnlyWithPrice = setOnlyWithPrice;
 
 window.onload = () => {
     loadState();
+    applyInitialRoute();
     render();
+    window.addEventListener('popstate', handlePopState);
     if (appState.view === 'home') {
         startSlider();
     }
