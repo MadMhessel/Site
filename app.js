@@ -1,5 +1,46 @@
 // --- КОНФИГУРАЦИЯ ---
-const GEMINI_PROXY_ENDPOINT = '/api/generate';
+const CONFIG = {
+    // Селекторы и имена классов, которые используются во всех модулях
+    selectors: {
+        editorToggle: '#editor-toggle',
+        editorPanel: '#editor-panel',
+        editorImportInput: '#editor-import-input',
+        editorUndo: '[data-editor-action="undo"]',
+        editorRedo: '[data-editor-action="redo"]',
+        editorExport: '[data-editor-action="export"]',
+        editorImport: '[data-editor-action="import"]',
+        editorHealthIndicator: '[data-editor-health-indicator]',
+        editorHealthText: '[data-editor-health-text]',
+        editable: '.js-editable',
+        dragHandle: '.js-drag',
+        groupsContainer: '[data-groups-container="catalog"]',
+    },
+    classes: {
+        editorMode: 'editor-mode',
+    },
+    editor: {
+        pinStorageKey: 'editorPin',
+        pinMinLength: 4,
+        textDebounce: 500,
+        orderSaveDelay: 300,
+        historyDepth: 50,
+        saltBytes: 16,
+    },
+    storage: {
+        stateKey: 'site_state_v1',
+        backupPrefix: 'site_state_backup_',
+        backupOnImport: 'backup:lastImport',
+        catalogOrderKey: 'catalogOrder:v1',
+        maxBackups: 3,
+    },
+    api: {
+        generate: '/api/generate',
+        health: '/api/health',
+        timeout: 20000,
+    },
+};
+
+const GEMINI_PROXY_ENDPOINT = CONFIG.api.generate;
 const LOGO_URL = 'https://i.imgur.com/RXyoozd.png';
 const PLACEHOLDER_IMAGE = 'https://placehold.co/600x400/e2e8f0/475569?text=No+Image';
 const FALLBACK_PRODUCTS = [
@@ -28,14 +69,55 @@ const VIEW_ROUTES = {
 
 const EDIT_QUERY_PARAM = 'edit';
 
-const STATE_STORAGE_KEY = 'site_state_v1';
-const STATE_BACKUP_PREFIX = 'site_state_backup_';
-const MAX_STATE_BACKUPS = 3;
-const STATE_SAVE_DEBOUNCE = 500;
-const EDITOR_PIN_STORAGE_KEY = 'site_editor_pin_hash';
-const EDITOR_PIN_DIGEST_PREFIX = 'sha256:';
+function isTruthyEditValue(rawValue) {
+    if (rawValue === null || rawValue === undefined) {
+        return true;
+    }
+    const normalized = String(rawValue).trim().toLowerCase();
+    return normalized === ''
+        || normalized === '1'
+        || normalized === 'true'
+        || normalized === 'on';
+}
 
-var UNDO_STACK_LIMIT = typeof UNDO_STACK_LIMIT === 'number' ? UNDO_STACK_LIMIT : 50;
+function getEditFlag() {
+    if (typeof window === 'undefined') {
+        return false;
+    }
+
+    try {
+        const params = new URLSearchParams(window.location.search || '');
+        if (params.has(EDIT_QUERY_PARAM)) {
+            const value = params.get(EDIT_QUERY_PARAM);
+            return isTruthyEditValue(value);
+        }
+    } catch (error) {
+        console.warn('[EDITOR:FLAG]', 'search-parse', error);
+    }
+
+    const hash = window.location.hash || '';
+    if (!hash) {
+        return false;
+    }
+    const match = hash.match(/[?#&]edit(?:=([^&#]+))?/i);
+    if (!match) {
+        return false;
+    }
+    const [, hashValue] = match;
+    return isTruthyEditValue(hashValue);
+}
+
+const STATE_STORAGE_KEY = CONFIG.storage.stateKey;
+const STATE_BACKUP_PREFIX = CONFIG.storage.backupPrefix;
+const MAX_STATE_BACKUPS = CONFIG.storage.maxBackups;
+const STATE_SAVE_DEBOUNCE = 500;
+const EDITOR_PIN_STORAGE_KEY = CONFIG.editor.pinStorageKey;
+const EDITOR_PIN_DIGEST_PREFIX = 'sha256:';
+const CATALOG_ORDER_STORAGE_KEY = CONFIG.storage.catalogOrderKey;
+const CATALOG_ORDER_VERSION = 1;
+const SNAPSHOT_VERSION = 1;
+
+var UNDO_STACK_LIMIT = typeof UNDO_STACK_LIMIT === 'number' ? UNDO_STACK_LIMIT : CONFIG.editor.historyDepth;
 var HISTORY_TRACKED_KEYS = (typeof HISTORY_TRACKED_KEYS !== 'undefined' && HISTORY_TRACKED_KEYS instanceof Set)
     ? HISTORY_TRACKED_KEYS
     : new Set();
@@ -56,6 +138,22 @@ var editorHistoryStore = (() => {
 })();
 
 const activeTextEditKeys = editorHistoryStore.activeTextEditKeys;
+
+const editorInputTimers = new Map();
+
+function flushEditorDebounceKey(key) {
+    const entry = editorInputTimers.get(key);
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    editorInputTimers.delete(key);
+    if (typeof entry.flush === 'function') {
+        entry.flush();
+    }
+}
+
+function flushAllEditorDebounceKeys() {
+    Array.from(editorInputTimers.keys()).forEach((key) => flushEditorDebounceKey(key));
+}
 
 const dirtyStateManager = (() => {
     const scope = typeof window !== 'undefined' ? window : globalThis;
@@ -224,36 +322,106 @@ function getSafeLocalStorage() {
     }
 }
 
-function normalizeEditorPinHash(value) {
-    if (typeof value !== 'string') {
-        return '';
-    }
-    return value.startsWith(EDITOR_PIN_DIGEST_PREFIX)
-        ? value.slice(EDITOR_PIN_DIGEST_PREFIX.length)
-        : value;
+function bufferToHex(buffer) {
+    return Array.from(buffer).map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-async function hashEditorPin(pin) {
-    const normalized = typeof pin === 'string' ? pin.trim() : '';
-    if (!normalized) {
-        return null;
+function hexToBuffer(hex) {
+    if (typeof hex !== 'string' || !hex.trim()) {
+        return new Uint8Array(0);
     }
-    if (typeof window !== 'undefined' && window.crypto?.subtle && typeof TextEncoder !== 'undefined') {
-        const encoder = new TextEncoder();
-        const data = encoder.encode(normalized);
-        const digest = await window.crypto.subtle.digest('SHA-256', data);
-        const hashArray = Array.from(new Uint8Array(digest));
-        const hex = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
-        return `${EDITOR_PIN_DIGEST_PREFIX}${hex}`;
+    const sanitized = hex.trim().replace(/[^0-9a-f]/gi, '');
+    if (sanitized.length % 2 !== 0) {
+        return new Uint8Array(0);
     }
+    const bytes = new Uint8Array(sanitized.length / 2);
+    for (let index = 0; index < sanitized.length; index += 2) {
+        bytes[index / 2] = parseInt(sanitized.slice(index, index + 2), 16);
+    }
+    return bytes;
+}
 
+function fallbackHash(value) {
+    const normalized = typeof value === 'string' ? value : String(value ?? '');
+    if (!normalized) return '';
     let hash = 0;
     for (let index = 0; index < normalized.length; index += 1) {
         hash = ((hash << 5) - hash) + normalized.charCodeAt(index);
         hash |= 0; // eslint-disable-line no-bitwise
     }
-    const fallbackHex = Math.abs(hash).toString(16);
-    return `${EDITOR_PIN_DIGEST_PREFIX}${fallbackHex}`;
+    return Math.abs(hash).toString(16);
+}
+
+async function digestLegacyPin(pin) {
+    const normalized = typeof pin === 'string' ? pin.trim() : '';
+    if (!normalized) {
+        return '';
+    }
+    if (typeof window !== 'undefined' && window.crypto?.subtle && typeof TextEncoder !== 'undefined') {
+        const encoder = new TextEncoder();
+        const data = encoder.encode(normalized);
+        const digest = await window.crypto.subtle.digest('SHA-256', data);
+        return bufferToHex(new Uint8Array(digest));
+    }
+    return fallbackHash(normalized);
+}
+
+async function digestPinWithSalt(pin, saltBytes) {
+    const normalized = typeof pin === 'string' ? pin.trim() : '';
+    if (!normalized) {
+        return '';
+    }
+    const saltHex = bufferToHex(saltBytes);
+    if (typeof window !== 'undefined' && window.crypto?.subtle && typeof TextEncoder !== 'undefined') {
+        const encoder = new TextEncoder();
+        const payload = encoder.encode(`${normalized}:${saltHex}`);
+        const digest = await window.crypto.subtle.digest('SHA-256', payload);
+        return bufferToHex(new Uint8Array(digest));
+    }
+    return fallbackHash(`${saltHex}:${normalized}`);
+}
+
+async function createPinRecord(pin) {
+    const salt = new Uint8Array(CONFIG.editor.saltBytes);
+    if (typeof window !== 'undefined' && window.crypto?.getRandomValues) {
+        window.crypto.getRandomValues(salt);
+    } else {
+        for (let index = 0; index < salt.length; index += 1) {
+            salt[index] = Math.floor(Math.random() * 256);
+        }
+    }
+    const hash = await digestPinWithSalt(pin, salt);
+    if (!hash) {
+        return null;
+    }
+    return {
+        version: 1,
+        algo: 'SHA-256',
+        salt: bufferToHex(salt),
+        hash,
+    };
+}
+
+async function verifyPinRecord(pin, record) {
+    if (!record) {
+        return false;
+    }
+    if (typeof record === 'string') {
+        const normalizedStored = record.startsWith(EDITOR_PIN_DIGEST_PREFIX)
+            ? record.slice(EDITOR_PIN_DIGEST_PREFIX.length)
+            : record;
+        const computed = await digestLegacyPin(pin);
+        return Boolean(computed) && computed === normalizedStored;
+    }
+    if (typeof record === 'object' && record.hash && record.salt) {
+        const saltBytes = hexToBuffer(record.salt);
+        if (!saltBytes.length) {
+            return false;
+        }
+        const computed = await digestPinWithSalt(pin, saltBytes);
+        return Boolean(computed) && computed === record.hash;
+    }
+    return false;
 }
 
 async function ensureEditorPin({ allowCreate = true } = {}) {
@@ -266,8 +434,8 @@ async function ensureEditorPin({ allowCreate = true } = {}) {
         return window.confirm('Локальное хранилище недоступно. Продолжить без проверки PIN?');
     }
 
-    const storedHash = storage.getItem(EDITOR_PIN_STORAGE_KEY);
-    if (!storedHash) {
+    const storedValue = storage.getItem(EDITOR_PIN_STORAGE_KEY);
+    if (!storedValue) {
         if (!allowCreate) {
             return false;
         }
@@ -276,7 +444,7 @@ async function ensureEditorPin({ allowCreate = true } = {}) {
             return false;
         }
         const firstPin = window.prompt('Введите новый PIN (минимум 4 символа):');
-        if (!firstPin || firstPin.trim().length < 4) {
+        if (!firstPin || firstPin.trim().length < CONFIG.editor.pinMinLength) {
             window.alert('PIN должен содержать минимум 4 символа.');
             return false;
         }
@@ -285,85 +453,78 @@ async function ensureEditorPin({ allowCreate = true } = {}) {
             window.alert('PIN не совпадает.');
             return false;
         }
-        const hashed = await hashEditorPin(firstPin);
-        if (!hashed) {
+        const record = await createPinRecord(firstPin);
+        if (!record) {
             window.alert('Не удалось сохранить PIN. Попробуйте снова.');
             return false;
         }
-        storage.setItem(EDITOR_PIN_STORAGE_KEY, hashed);
+        storage.setItem(EDITOR_PIN_STORAGE_KEY, JSON.stringify(record));
         return true;
+    }
+
+    let storedRecord = null;
+    try {
+        storedRecord = JSON.parse(storedValue);
+    } catch (error) {
+        storedRecord = storedValue;
     }
 
     const pin = window.prompt('Введите PIN редактора:');
     if (pin === null) {
         return false;
     }
-    const hashed = await hashEditorPin(pin);
-    if (!hashed) {
+    if (!pin.trim()) {
         window.alert('PIN не может быть пустым.');
         return false;
     }
-    if (normalizeEditorPinHash(hashed) === normalizeEditorPinHash(storedHash)) {
-        return true;
+    const success = await verifyPinRecord(pin, storedRecord);
+    if (success && typeof storedRecord === 'string') {
+        const upgraded = await createPinRecord(pin);
+        if (upgraded) {
+            storage.setItem(EDITOR_PIN_STORAGE_KEY, JSON.stringify(upgraded));
+        }
     }
-    window.alert('Неверный PIN.');
-    return false;
+    if (!success) {
+        window.alert('Неверный PIN.');
+    }
+    return success;
 }
 
-if (!window.editorMode) {
-    const extractEditFlag = () => {
-        const searchParams = new URLSearchParams(window.location.search);
-        if (searchParams.has(EDIT_QUERY_PARAM)) {
-            return {
-                rawValue: searchParams.get(EDIT_QUERY_PARAM),
-                isPresent: true,
-            };
-        }
 
-        const hash = window.location.hash || '';
-        const queryIndex = hash.indexOf('?');
-        if (queryIndex !== -1) {
-            const hashQuery = hash.slice(queryIndex + 1);
-            const hashParams = new URLSearchParams(hashQuery);
-            if (hashParams.has(EDIT_QUERY_PARAM)) {
-                return {
-                    rawValue: hashParams.get(EDIT_QUERY_PARAM),
-                    isPresent: true,
-                };
-            }
-        }
-
-        return { rawValue: null, isPresent: false };
-    };
-
-    const { rawValue: rawFlag, isPresent: isFlagPresent } = extractEditFlag();
-    const normalizedFlag = typeof rawFlag === 'string' ? rawFlag.trim().toLowerCase() : null;
-    const falsyFlags = new Set(['0', 'false', 'no', 'off', 'disable', 'disabled']);
-    const isEnabled = isFlagPresent && !falsyFlags.has(normalizedFlag || '');
-    const handlers = new WeakMap();
-    const documentAvailable = typeof document !== 'undefined';
-    const getBodyElement = () => (documentAvailable ? document.body : null);
+const Editor = (() => {
     const state = {
-        isEnabled,
+        isEnabled: false,
         isActive: false,
         isAuthorized: false,
         authorizationPromise: null,
         button: null,
-        initialized: false,
-        handlers,
         panel: null,
-        panelInitialized: false,
+        undoButton: null,
+        redoButton: null,
         exportButton: null,
         importButton: null,
         importInput: null,
-        undoButton: null,
-        redoButton: null,
+        healthIndicator: null,
+        healthText: null,
+        handlers: new WeakMap(),
+        boundListeners: [],
+        initialized: false,
     };
 
-    const initialBody = getBodyElement();
-    if (initialBody) {
-        initialBody.classList.toggle('editor-mode', state.isActive);
-    }
+    const documentAvailable = typeof document !== 'undefined';
+
+    const bind = (target, type, handler, options) => {
+        if (!target || typeof target.addEventListener !== 'function') return;
+        target.addEventListener(type, handler, options);
+        state.boundListeners.push({ target, type, handler, options });
+    };
+
+    const unbindAll = () => {
+        state.boundListeners.forEach(({ target, type, handler, options }) => {
+            target.removeEventListener(type, handler, options);
+        });
+        state.boundListeners.length = 0;
+    };
 
     const emitEditorChanged = (element, trigger) => {
         const text = element.textContent ?? '';
@@ -386,112 +547,20 @@ if (!window.editorMode) {
         state.handlers.delete(element);
     };
 
-    const createHandler = (element) => (event) => {
-        emitEditorChanged(element, event.type);
+    const attachHandler = (element) => {
+        if (state.handlers.has(element)) return;
+        const listener = (event) => emitEditorChanged(element, event.type);
+        element.addEventListener('input', listener);
+        element.addEventListener('blur', listener);
+        state.handlers.set(element, listener);
     };
 
-    const updatePanelVisibility = () => {
-        if (!state.panel) return;
-        const shouldShow = state.isEnabled && state.isActive;
-        state.panel.style.display = shouldShow ? 'flex' : 'none';
-        state.panel.setAttribute('aria-hidden', shouldShow ? 'false' : 'true');
-    };
-
-    const initializeEditorPanel = () => {
-        if (!documentAvailable || state.panelInitialized) return;
-        const panel = document.getElementById('editor-panel');
-        if (!panel) return;
-
-        const undoButton = panel.querySelector('[data-editor-action="undo"]');
-        const redoButton = panel.querySelector('[data-editor-action="redo"]');
-        const exportButton = panel.querySelector('[data-editor-action="export"]');
-        const importButton = panel.querySelector('[data-editor-action="import"]');
-        const importInput = document.getElementById('editor-import-input')
-            || panel.querySelector('input[type="file"]');
-
-        if (undoButton) {
-            undoButton.addEventListener('click', () => {
-                if (!state.isEnabled || !state.isActive) return;
-                undoStateChange();
-            });
-        }
-
-        if (redoButton) {
-            redoButton.addEventListener('click', () => {
-                if (!state.isEnabled || !state.isActive) return;
-                redoStateChange();
-            });
-        }
-
-        if (exportButton) {
-            exportButton.addEventListener('click', () => {
-                if (!state.isEnabled || !state.isActive) return;
-                exportStateSnapshot();
-            });
-        }
-
-        if (importButton && importInput) {
-            importButton.addEventListener('click', () => {
-                if (!state.isEnabled || !state.isActive) return;
-                if (typeof window !== 'undefined') {
-                    const confirmed = window.confirm('Импорт заменит текущее состояние. Продолжить?');
-                    if (!confirmed) return;
-                }
-                importInput.value = '';
-                importInput.click();
-            });
-
-            importInput.addEventListener('change', async (event) => {
-                const input = event.target;
-                const selectedFile = input.files && input.files[0];
-                if (selectedFile) {
-                    await importStateFromFile(selectedFile);
-                }
-                input.value = '';
-            });
-        }
-
-        state.panel = panel;
-        state.exportButton = exportButton;
-        state.importButton = importButton;
-        state.importInput = importInput;
-        state.undoButton = undoButton;
-        state.redoButton = redoButton;
-        state.panelInitialized = true;
-        updatePanelVisibility();
-        updateEditorHistoryButtons();
-    };
-
-    const applyEditableState = () => {
-        if (!documentAvailable) return;
-        initializeEditorPanel();
-        const elements = document.querySelectorAll('.js-editable');
-        elements.forEach((element) => {
-            const handler = state.handlers.get(element);
-            if (!state.isEnabled || !state.isActive) {
-                if (handler) {
-                    detachHandler(element);
-                }
-                if (element.hasAttribute('contenteditable')) {
-                    element.removeAttribute('contenteditable');
-                }
-                return;
-            }
-
-            if (!handler) {
-                const listener = createHandler(element);
-                element.addEventListener('input', listener);
-                element.addEventListener('blur', listener);
-                state.handlers.set(element, listener);
-            }
-
-            if (typeof computeEditorKey === 'function') {
-                computeEditorKey(element);
-            }
-            element.setAttribute('contenteditable', 'plaintext-only');
-        });
-        updatePanelVisibility();
-        refreshCatalogSortables();
+    const updateToggleVisibility = () => {
+        if (!state.button) return;
+        const shouldShow = Boolean(state.isEnabled);
+        state.button.style.display = shouldShow ? 'inline-flex' : 'none';
+        state.button.hidden = !shouldShow;
+        state.button.setAttribute('aria-hidden', shouldShow ? 'false' : 'true');
     };
 
     const updateButtonState = () => {
@@ -503,91 +572,277 @@ if (!window.editorMode) {
     };
 
     const updateBodyClass = () => {
-        const body = getBodyElement();
-        if (body) {
-            body.classList.toggle('editor-mode', Boolean(state.isEnabled && state.isActive));
+        if (!documentAvailable || !document.body) return;
+        document.body.classList.toggle(CONFIG.classes.editorMode, Boolean(state.isEnabled && state.isActive));
+    };
+
+    const updatePanelVisibility = () => {
+        if (!state.panel) return;
+        const shouldShow = Boolean(state.isEnabled && state.isActive);
+        state.panel.style.display = shouldShow ? 'flex' : 'none';
+        state.panel.hidden = !shouldShow;
+        state.panel.setAttribute('aria-hidden', shouldShow ? 'false' : 'true');
+    };
+
+    const applyEditableState = () => {
+        if (!documentAvailable) return;
+        const elements = document.querySelectorAll(CONFIG.selectors.editable);
+        elements.forEach((element) => {
+            if (!state.isActive || !state.isEnabled) {
+                detachHandler(element);
+                if (element.hasAttribute('contenteditable')) {
+                    element.removeAttribute('contenteditable');
+                }
+                element.removeAttribute('aria-live');
+                return;
+            }
+            attachHandler(element);
+            if (typeof computeEditorKey === 'function') {
+                computeEditorKey(element);
+            }
+            element.setAttribute('contenteditable', 'plaintext-only');
+            if (element.contentEditable !== 'plaintext-only') {
+                element.setAttribute('contenteditable', 'true');
+            }
+            element.setAttribute('aria-live', 'polite');
+        });
+        if (state.isActive && state.isEnabled) {
+            syncEditableContent({ captureMissing: true });
+        }
+        updatePanelVisibility();
+        refreshCatalogSortables();
+    };
+
+    const flushPendingEdits = () => {
+        if (typeof flushAllEditorDebounceKeys === 'function') {
+            flushAllEditorDebounceKeys();
         }
     };
 
-    const requestEditorAuthorization = async () => {
+    const handleUndoClick = (event) => {
+        event.preventDefault();
+        if (!state.isActive || !state.isEnabled) return;
+        undoStateChange();
+    };
+
+    const handleRedoClick = (event) => {
+        event.preventDefault();
+        if (!state.isActive || !state.isEnabled) return;
+        redoStateChange();
+    };
+
+    const handleExportClick = (event) => {
+        event.preventDefault();
+        if (!state.isActive || !state.isEnabled) return;
+        exportStateSnapshot();
+    };
+
+    const handleImportClick = (event) => {
+        event.preventDefault();
+        if (!state.isActive || !state.isEnabled || !state.importInput) return;
+        if (typeof window !== 'undefined') {
+            const confirmed = window.confirm('Импорт заменит текущее состояние. Продолжить?');
+            if (!confirmed) {
+                return;
+            }
+        }
+        state.importInput.value = '';
+        state.importInput.click();
+    };
+
+    const handleImportChange = async (event) => {
+        const input = event?.target;
+        const selectedFile = input?.files?.[0];
+        if (selectedFile) {
+            await importStateFromFile(selectedFile);
+        }
+        if (input) {
+            input.value = '';
+        }
+    };
+
+    const initializePanel = () => {
+        if (!documentAvailable || !state.panel) return;
+        state.undoButton = state.panel.querySelector(CONFIG.selectors.editorUndo);
+        state.redoButton = state.panel.querySelector(CONFIG.selectors.editorRedo);
+        state.exportButton = state.panel.querySelector(CONFIG.selectors.editorExport);
+        state.importButton = state.panel.querySelector(CONFIG.selectors.editorImport);
+        state.importInput = document.querySelector(CONFIG.selectors.editorImportInput);
+        state.healthIndicator = state.panel.querySelector(CONFIG.selectors.editorHealthIndicator);
+        state.healthText = state.panel.querySelector(CONFIG.selectors.editorHealthText);
+
+        if (state.undoButton) bind(state.undoButton, 'click', handleUndoClick);
+        if (state.redoButton) bind(state.redoButton, 'click', handleRedoClick);
+        if (state.exportButton) bind(state.exportButton, 'click', handleExportClick);
+        if (state.importButton) bind(state.importButton, 'click', handleImportClick);
+        if (state.importInput) bind(state.importInput, 'change', handleImportChange);
+    };
+
+    const requestAuthorization = async () => {
         if (state.isAuthorized) {
             return true;
         }
         if (state.authorizationPromise) {
             return state.authorizationPromise;
         }
-        const promise = ensureEditorPin({ allowCreate: true }).then((authorized) => {
-            state.authorizationPromise = null;
-            if (authorized) {
-                state.isAuthorized = true;
-            }
-            return authorized;
-        });
+        const promise = ensureEditorPin({ allowCreate: true })
+            .then((authorized) => {
+                state.authorizationPromise = null;
+                if (authorized) {
+                    state.isAuthorized = true;
+                }
+                return authorized;
+            })
+            .catch((error) => {
+                state.authorizationPromise = null;
+                console.error('[EDITOR:AUTH]', error);
+                return false;
+            });
         state.authorizationPromise = promise;
         return promise;
     };
 
-    const setupEditorButton = () => {
-        if (state.initialized) {
-            updateButtonState();
-            updateBodyClass();
-            applyEditableState();
+    const activate = async () => {
+        state.isEnabled = true;
+        updateToggleVisibility();
+        const authorized = await requestAuthorization();
+        if (!authorized) {
+            return false;
+        }
+        state.isActive = true;
+        updateBodyClass();
+        updateButtonState();
+        applyEditableState();
+        updatePanelVisibility();
+        updateEditorHistoryButtons();
+        return true;
+    };
+
+    const deactivate = () => {
+        if (!state.isActive) return;
+        flushPendingEdits();
+        state.isActive = false;
+        updateBodyClass();
+        applyEditableState();
+        updateButtonState();
+        updatePanelVisibility();
+        updateEditorHistoryButtons();
+    };
+
+    const toggle = async () => {
+        if (state.isActive) {
+            deactivate();
             return;
         }
+        await activate();
+    };
 
-        state.initialized = true;
-        state.button = documentAvailable ? document.getElementById('editor-toggle') : null;
-        initializeEditorPanel();
+    const handleToggleClick = async (event) => {
+        event.preventDefault();
+        await toggle();
+    };
 
-        if (!state.button) {
-            applyEditableState();
-            return;
-        }
-
-        if (!state.isEnabled) {
-            state.button.style.display = 'none';
-            state.isActive = false;
-            state.isAuthorized = false;
-            state.authorizationPromise = null;
-            const body = getBodyElement();
-            if (body) {
-                body.classList.remove('editor-mode');
+    const handleKeydown = async (event) => {
+        if (event.defaultPrevented) return;
+        const key = event.key?.toLowerCase?.() || event.key;
+        if ((event.ctrlKey || event.metaKey) && key === 'e') {
+            event.preventDefault();
+            if (!state.isEnabled) {
+                state.isEnabled = true;
+                updateToggleVisibility();
             }
-            updatePanelVisibility();
-            updateBodyClass();
-            applyEditableState();
-            return;
+            await toggle();
+        } else if (event.key === 'Escape' && state.isActive) {
+            event.preventDefault();
+            deactivate();
         }
+    };
 
-        state.button.style.display = 'block';
+    const refreshHealthIndicator = (ok, message = '') => {
+        if (!state.healthIndicator) return;
+        state.healthIndicator.classList.remove('bg-green-500', 'bg-red-500', 'bg-gray-300');
+        const statusClass = ok === true ? 'bg-green-500' : ok === false ? 'bg-red-500' : 'bg-gray-300';
+        state.healthIndicator.classList.add(statusClass);
+        if (state.healthText) {
+            state.healthText.textContent = ok ? 'Онлайн' : 'Нет связи';
+            if (message) {
+                state.healthText.setAttribute('title', message);
+            } else {
+                state.healthText.removeAttribute('title');
+            }
+        }
+    };
+
+    const refresh = () => {
+        state.isEnabled = state.isEnabled || getEditFlag();
+        updateToggleVisibility();
         updateButtonState();
         updateBodyClass();
-
-        state.button.addEventListener('click', async () => {
-            if (!state.isActive) {
-                const authorized = await requestEditorAuthorization();
-                if (!authorized) {
-                    return;
-                }
-                state.isActive = true;
-            } else {
-                state.isActive = false;
-            }
-            updateBodyClass();
-            updateButtonState();
-            applyEditableState();
-        });
-
         applyEditableState();
+        updatePanelVisibility();
+        updateEditorHistoryButtons();
     };
 
-    window.editorMode = {
-        state,
-        refresh: applyEditableState,
-        setup: setupEditorButton,
+    const init = () => {
+        if (!documentAvailable || state.initialized) return;
+        state.isEnabled = getEditFlag();
+        state.button = document.querySelector(CONFIG.selectors.editorToggle);
+        state.panel = document.querySelector(CONFIG.selectors.editorPanel);
+        if (state.panel) {
+            initializePanel();
+        }
+        updateToggleVisibility();
+        updateButtonState();
+        updatePanelVisibility();
+        if (state.button) {
+            bind(state.button, 'click', handleToggleClick);
+        }
+        bind(document, 'keydown', handleKeydown);
+        state.initialized = true;
+        refresh();
+        if (window.App?.Api?.checkHealth) {
+            window.App.Api.checkHealth()
+                .then((result) => {
+                    const ok = result?.ok !== false;
+                    refreshHealthIndicator(ok, result?.message || '');
+                })
+                .catch((error) => {
+                    refreshHealthIndicator(false, error.message || 'Ошибка подключения');
+                });
+        }
     };
-    updateEditorHistoryButtons();
-}
+
+    const destroy = () => {
+        if (!state.initialized) return;
+        deactivate();
+        unbindAll();
+        const elements = documentAvailable ? document.querySelectorAll(CONFIG.selectors.editable) : [];
+        elements.forEach((element) => detachHandler(element));
+        state.initialized = false;
+        state.button = null;
+        state.panel = null;
+        state.isEnabled = false;
+        state.isAuthorized = false;
+        state.authorizationPromise = null;
+        updateToggleVisibility();
+        updatePanelVisibility();
+    };
+
+    return {
+        state,
+        init,
+        setup: init,
+        refresh,
+        toggle: () => toggle(),
+        enter: () => activate(),
+        exit: () => deactivate(),
+        destroy,
+        updateHealthStatus: refreshHealthIndicator,
+    };
+})();
+
+window.editorMode = Editor;
+updateEditorHistoryButtons();
 
 function getHashForView(view) {
     const segment = VIEW_ROUTES[view] ?? '';
@@ -1555,7 +1810,7 @@ function cloneStateSnapshot() {
 function buildStateExportFileName() {
     const now = new Date();
     const pad = (value) => String(value).padStart(2, '0');
-    return `site-state-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}.json`;
+    return `site-snapshot-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.json`;
 }
 
 function downloadJsonFile(fileName, jsonString) {
@@ -1571,9 +1826,163 @@ function downloadJsonFile(fileName, jsonString) {
     URL.revokeObjectURL(url);
 }
 
+function buildSnapshotPayload() {
+    const defaults = createDefaultState();
+    const categories = Array.isArray(state.groups?.catalogCategories)
+        ? state.groups.catalogCategories.map((category) => cloneCatalogCategory(category) || null).filter(Boolean)
+        : [];
+    const products = Array.isArray(state.items?.products)
+        ? state.items.products.map((product) => {
+            try {
+                return JSON.parse(JSON.stringify(product));
+            } catch (error) {
+                return { ...product };
+            }
+        })
+        : [];
+    const order = {
+        groups: Array.isArray(state.layout?.groupsOrder) ? [...state.layout.groupsOrder] : [],
+        itemsByGroup: state.layout?.itemsOrderByGroup
+            ? Object.fromEntries(
+                Object.entries(state.layout.itemsOrderByGroup).map(([group, value]) => [group, Array.isArray(value) ? [...value] : []]),
+            )
+            : {},
+    };
+    const texts = state.texts ? { ...state.texts } : {};
+    const layout = {
+        view: state.layout?.view || defaults.layout.view,
+        slides: Array.isArray(state.layout?.slides)
+            ? state.layout.slides.map((slide) => ({ ...slide }))
+            : defaults.layout.slides.map((slide) => ({ ...slide })),
+    };
+    const meta = {
+        searchTerm: state.meta?.searchTerm || defaults.meta.searchTerm,
+        onlyWithPrice: Boolean(state.meta?.onlyWithPrice),
+        sortBy: state.meta?.sortBy || defaults.meta.sortBy,
+    };
+    return {
+        version: SNAPSHOT_VERSION,
+        timestamp: new Date().toISOString(),
+        catalog: { categories, products, order },
+        texts,
+        layout,
+        meta,
+    };
+}
+
+let catalogOrderSaveTimeoutId = null;
+
+async function persistCatalogOrderSnapshot() {
+    const storage = await getStateStorage();
+    if (!storage) return;
+    const payload = {
+        version: CATALOG_ORDER_VERSION,
+        timestamp: new Date().toISOString(),
+        groupsOrder: Array.isArray(state.layout?.groupsOrder) ? [...state.layout.groupsOrder] : [],
+        itemsOrderByGroup: state.layout?.itemsOrderByGroup
+            ? Object.fromEntries(
+                Object.entries(state.layout.itemsOrderByGroup).map(([group, order]) => [group, Array.isArray(order) ? [...order] : []]),
+            )
+            : {},
+    };
+    try {
+        await storage.setItem(CATALOG_ORDER_STORAGE_KEY, payload);
+    } catch (error) {
+        console.warn('[STATE:ORDER]', 'save', error.message || error);
+    }
+}
+
+function scheduleCatalogOrderSave() {
+    if (catalogOrderSaveTimeoutId) {
+        clearTimeout(catalogOrderSaveTimeoutId);
+    }
+    catalogOrderSaveTimeoutId = setTimeout(() => {
+        catalogOrderSaveTimeoutId = null;
+        persistCatalogOrderSnapshot();
+    }, CONFIG.editor.orderSaveDelay);
+}
+
+async function loadCatalogOrderFromStorage() {
+    const storage = await getStateStorage();
+    if (!storage) return;
+    try {
+        const snapshot = await storage.getItem(CATALOG_ORDER_STORAGE_KEY);
+        if (!snapshot || typeof snapshot !== 'object') {
+            return;
+        }
+        if (snapshot.version && snapshot.version !== CATALOG_ORDER_VERSION) {
+            return;
+        }
+        if (Array.isArray(snapshot.groupsOrder)) {
+            state.layout.groupsOrder = snapshot.groupsOrder.filter(Boolean);
+        }
+        if (snapshot.itemsOrderByGroup && typeof snapshot.itemsOrderByGroup === 'object') {
+            const normalized = {};
+            Object.entries(snapshot.itemsOrderByGroup).forEach(([group, order]) => {
+                normalized[group] = Array.isArray(order) ? order.filter(Boolean) : [];
+            });
+            state.layout.itemsOrderByGroup = normalized;
+        }
+    } catch (error) {
+        console.warn('[STATE:ORDER]', 'load', error.message || error);
+    }
+}
+
+async function backupCurrentStateForImport() {
+    const storage = await getStateStorage();
+    if (!storage) return;
+    try {
+        const payload = {
+            version: SNAPSHOT_VERSION,
+            timestamp: new Date().toISOString(),
+            snapshot: buildSnapshotPayload(),
+        };
+        await storage.setItem(CONFIG.storage.backupOnImport, payload);
+    } catch (error) {
+        console.warn('[STATE:BACKUP]', 'import', error.message || error);
+    }
+}
+
+function apiRequest(url, options = {}) {
+    const { timeout = CONFIG.api.timeout, ...fetchOptions } = options;
+    if (typeof AbortController === 'undefined') {
+        return fetch(url, fetchOptions);
+    }
+    const controller = new AbortController();
+    const signal = controller.signal;
+    const timer = setTimeout(() => controller.abort(), timeout);
+    return fetch(url, { ...fetchOptions, signal })
+        .catch((error) => {
+            if (error.name === 'AbortError') {
+                const timeoutError = new Error('Превышено время ожидания ответа от сервера.');
+                timeoutError.code = 'timeout';
+                throw timeoutError;
+            }
+            throw error;
+        })
+        .finally(() => {
+            clearTimeout(timer);
+        });
+}
+
+async function checkApiHealth() {
+    try {
+        const response = await apiRequest(CONFIG.api.health, { method: 'GET' });
+        if (!response.ok) {
+            return { ok: false, message: `Статус ${response.status}` };
+        }
+        return { ok: true };
+    } catch (error) {
+        if (error.code === 'timeout') {
+            return { ok: false, message: 'Превышено время ожидания ответа.' };
+        }
+        return { ok: false, message: error.message || 'Недоступен сервер.' };
+    }
+}
+
 function exportStateSnapshot() {
     try {
-        const snapshot = cloneStateSnapshot();
+        const snapshot = buildSnapshotPayload();
         const jsonString = JSON.stringify(snapshot, null, 2);
         downloadJsonFile(buildStateExportFileName(), jsonString);
     } catch (error) {
@@ -1585,6 +1994,46 @@ function exportStateSnapshot() {
 function validateImportedSnapshot(snapshot) {
     if (!snapshot || typeof snapshot !== 'object') {
         throw new Error('Некорректный JSON-файл.');
+    }
+    if (snapshot.version) {
+        if (snapshot.version !== SNAPSHOT_VERSION) {
+            throw new Error(`Неподдерживаемая версия схемы: ${snapshot.version}`);
+        }
+        if (!snapshot.catalog || typeof snapshot.catalog !== 'object') {
+            throw new Error('Отсутствует раздел catalog.');
+        }
+        if (!Array.isArray(snapshot.catalog.categories)) {
+            throw new Error('Поле "catalog.categories" должно быть массивом.');
+        }
+        if (!Array.isArray(snapshot.catalog.products)) {
+            throw new Error('Поле "catalog.products" должно быть массивом.');
+        }
+        if (!snapshot.catalog.order || typeof snapshot.catalog.order !== 'object') {
+            throw new Error('Поле "catalog.order" должно быть объектом.');
+        }
+        if (!snapshot.texts || typeof snapshot.texts !== 'object') {
+            throw new Error('Поле "texts" должно быть объектом.');
+        }
+        const defaults = createDefaultState();
+        const normalizedLayout = {
+            ...defaults.layout,
+            ...(snapshot.layout || {}),
+            groupsOrder: Array.isArray(snapshot.catalog.order.groups) ? snapshot.catalog.order.groups : [],
+            itemsOrderByGroup: snapshot.catalog.order.itemsByGroup && typeof snapshot.catalog.order.itemsByGroup === 'object'
+                ? snapshot.catalog.order.itemsByGroup
+                : {},
+        };
+        const normalizedMeta = {
+            ...defaults.meta,
+            ...(snapshot.meta || {}),
+        };
+        return {
+            items: { products: snapshot.catalog.products },
+            groups: { catalogCategories: snapshot.catalog.categories },
+            layout: normalizedLayout,
+            texts: snapshot.texts || {},
+            meta: normalizedMeta,
+        };
     }
     const requiredKeys = ['items', 'groups', 'layout', 'texts'];
     const missing = requiredKeys.filter((key) => !Object.prototype.hasOwnProperty.call(snapshot, key));
@@ -1632,6 +2081,7 @@ async function applyImportedSnapshot(importedState) {
     commitUndoSnapshot(undoSnapshot);
 
     ensureLayoutOrdering();
+    await persistCatalogOrderSnapshot();
 
     if (stateSaveTimeoutId) {
         clearTimeout(stateSaveTimeoutId);
@@ -1659,6 +2109,7 @@ async function importStateFromFile(file) {
         const text = await file.text();
         const parsed = JSON.parse(text);
         const snapshot = validateImportedSnapshot(parsed);
+        await backupCurrentStateForImport();
         await applyImportedSnapshot(snapshot);
     } catch (error) {
         console.error('[EDITOR:IMPORT]', error);
@@ -1748,6 +2199,7 @@ function ensureLayoutOrdering({ persist = false } = {}) {
 
     if ((groupsChanged || itemsChanged) && persist) {
         scheduleStateSave();
+        scheduleCatalogOrderSave();
     }
 
     return groupsChanged || itemsChanged;
@@ -1947,6 +2399,7 @@ async function initializeState() {
     if (!state.layout.slides.length) {
         state.layout.slides = defaults.layout.slides;
     }
+    await loadCatalogOrderFromStorage();
     ensureLayoutOrdering({ persist: true });
     if (storage && !storedState) {
         await saveStateSnapshot(true);
@@ -2018,19 +2471,41 @@ function syncEditableContent({ captureMissing = false } = {}) {
     return stateChanged;
 }
 
+function commitEditorTextChange(element, key) {
+    const text = element.textContent ?? '';
+    const previousText = state.texts[key];
+    if (previousText === text) {
+        return false;
+    }
+    state.texts[key] = text;
+    scheduleStateSave();
+    return true;
+}
+
 function handleEditorChanged(event) {
     const element = event?.target;
     if (!element || typeof element !== 'object') return;
     const key = computeEditorKey(element);
     if (!key) return;
-    const text = element.textContent ?? '';
-    const trigger = event?.detail?.trigger || null;
+    const trigger = event?.detail?.trigger || event.type || null;
+    const currentText = element.textContent ?? '';
     const previousText = state.texts[key];
 
-    if (previousText === text) {
-        if (trigger === 'blur') {
+    if (trigger === 'blur') {
+        if (editorInputTimers.has(key)) {
+            flushEditorDebounceKey(key);
+        } else if (previousText !== currentText) {
+            if (commitEditorTextChange(element, key)) {
+                updateEditorHistoryButtons();
+            }
+            activeTextEditKeys.delete(key);
+        } else {
             activeTextEditKeys.delete(key);
         }
+        return;
+    }
+
+    if (previousText === currentText) {
         return;
     }
 
@@ -2040,12 +2515,23 @@ function handleEditorChanged(event) {
         activeTextEditKeys.add(key);
     }
 
-    state.texts[key] = text;
-    scheduleStateSave();
-
-    if (trigger === 'blur') {
+    const flushCallback = () => {
+        if (commitEditorTextChange(element, key)) {
+            updateEditorHistoryButtons();
+        }
         activeTextEditKeys.delete(key);
+    };
+
+    if (editorInputTimers.has(key)) {
+        clearTimeout(editorInputTimers.get(key).timer);
     }
+
+    const timer = setTimeout(() => {
+        editorInputTimers.delete(key);
+        flushCallback();
+    }, CONFIG.editor.textDebounce);
+
+    editorInputTimers.set(key, { timer, flush: flushCallback });
 }
 
 if (typeof document !== 'undefined') {
@@ -2074,7 +2560,7 @@ if (typeof window !== 'undefined') {
 window.adminState = {
     productName: '', productPrice: '', productUnit: 'шт',
     productImage: 'https://placehold.co/400x300/e2e8f0/94a3b8?text=Стройматериал',
-    productDescription: '', isGenerating: false, jsonInput: '',
+    productDescription: '', isGenerating: false, jsonInput: '', apiError: null,
 };
 
 // --- Утилиты ---
@@ -2248,6 +2734,9 @@ function setState(newState, callback = null) {
         commitUndoSnapshot(undoSnapshot);
     }
     scheduleStateSave();
+    if (changedKeys.some((key) => key === 'groupsOrder' || key === 'itemsOrderByGroup')) {
+        scheduleCatalogOrderSave();
+    }
     render();
     if (callback) callback();
 }
@@ -2645,17 +3134,19 @@ async function generateDescription(productName) {
     }
 
     try {
-        const response = await fetch(GEMINI_PROXY_ENDPOINT, {
+        const response = await apiRequest(GEMINI_PROXY_ENDPOINT, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ productName: normalizedName }),
         });
 
+        if (response.status === 429) {
+            throw new Error('Лимит запросов к генератору исчерпан. Попробуйте позже.');
+        }
         if (!response.ok) {
-            let errorMessage = `API failed: ${response.status} ${response.statusText}`;
+            let errorMessage = `Сервер вернул статус ${response.status}`;
             try {
                 const errorBody = await response.json();
-                console.error('[GEMINI_ERROR]', errorBody);
                 if (errorBody?.error?.message) {
                     errorMessage = errorBody.error.message;
                 }
@@ -2672,10 +3163,13 @@ async function generateDescription(productName) {
         return description || 'Не удалось сгенерировать описание.';
     } catch (error) {
         console.error('[GEMINI_PROXY_REQUEST_ERROR]', error);
-        if (error.name === 'TypeError') {
-            return 'Проблема с сетью. Проверьте подключение к интернету.';
+        if (error.code === 'timeout') {
+            throw new Error('Превышено время ожидания ответа от сервера (20 секунд). Попробуйте повторить запрос.');
         }
-        return `Ошибка: ${error.message}`;
+        if (error.name === 'TypeError') {
+            throw new Error('Не удалось подключиться к серверу. Проверьте интернет-соединение.');
+        }
+        throw new Error(error.message || 'Не удалось получить ответ от сервера.');
     }
 }
 
@@ -3893,6 +4387,7 @@ function renderAdminPanel() {
         productDescription,
         jsonInput,
         isGenerating,
+        apiError,
     } = window.adminState;
 
     const sanitizedName = escapeHtmlAttribute(productName);
@@ -3928,6 +4423,7 @@ function renderAdminPanel() {
                      </div>
                      <textarea id="description" rows="4" placeholder="Описание" class="w-full border p-2 rounded" required>${sanitizedDescription}</textarea>
                  </div>
+                 ${apiError ? `<div class="flex items-start justify-between gap-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-700" role="alert"><span class="flex-1">${escapeHtml(apiError.message || 'Неизвестная ошибка')}</span><button type="button" data-admin-action="retry-generation" class="shrink-0 rounded-md border border-amber-500 px-3 py-1 text-xs font-semibold text-amber-700 transition hover:bg-amber-100">Повторить</button></div>` : ''}
                  <button type="submit" class="w-full bg-gray-800 hover:bg-gray-700 text-white py-2 rounded-lg">Добавить товар</button>
              </form>
         </div>`;
@@ -3967,6 +4463,7 @@ function renderAdminPanel() {
         if (nameInput) {
             nameInput.addEventListener('input', (event) => {
                 window.adminState.productName = event.target.value;
+                window.adminState.apiError = null;
             });
         }
         if (priceInput) {
@@ -3989,20 +4486,33 @@ function renderAdminPanel() {
                 window.adminState.productDescription = event.target.value;
             });
         }
-        if (generateButton) {
-            generateButton.addEventListener('click', async () => {
-                if (window.adminState.isGenerating || !window.adminState.productName.trim()) {
-                    return;
-                }
-                window.adminState.isGenerating = true;
+        const runGeneration = async () => {
+            if (window.adminState.isGenerating || !window.adminState.productName.trim()) {
+                return;
+            }
+            window.adminState.isGenerating = true;
+            window.adminState.apiError = null;
+            renderAdminContent();
+            try {
+                const desc = await generateDescription(window.adminState.productName);
+                window.adminState.productDescription = desc;
+            } catch (error) {
+                window.adminState.apiError = { message: error.message || 'Не удалось выполнить запрос.' };
+            } finally {
+                window.adminState.isGenerating = false;
                 renderAdminContent();
-                try {
-                    const desc = await generateDescription(window.adminState.productName);
-                    window.adminState.productDescription = desc;
-                } finally {
-                    window.adminState.isGenerating = false;
-                    renderAdminContent();
-                }
+            }
+        };
+
+        if (generateButton) {
+            generateButton.addEventListener('click', runGeneration);
+        }
+
+        const retryButton = form.querySelector('[data-admin-action="retry-generation"]');
+        if (retryButton) {
+            retryButton.addEventListener('click', (event) => {
+                event.preventDefault();
+                runGeneration();
             });
         }
 
@@ -4022,6 +4532,7 @@ function renderAdminPanel() {
                 productUnit: 'шт',
                 productDescription: '',
                 productImage: 'https://placehold.co/400x300/e2e8f0/94a3b8?text=Стройматериал',
+                apiError: null,
             };
             renderAdminContent();
         });
@@ -4123,6 +4634,54 @@ function render() {
 }
 
 // --- Инициализация ---
+const CatalogModule = {
+    refreshSortables: refreshCatalogSortables,
+    destroySortables: destroyCatalogSortables,
+    ensureLayoutOrdering,
+    scheduleOrderSave: scheduleCatalogOrderSave,
+    persistOrder: persistCatalogOrderSnapshot,
+    loadOrder: loadCatalogOrderFromStorage,
+};
+
+const HistoryModule = {
+    undo: undoStateChange,
+    redo: redoStateChange,
+    prepareSnapshot: prepareUndoSnapshot,
+    commitSnapshot: commitUndoSnapshot,
+    pushRedoSnapshot,
+};
+
+const StorageModule = {
+    getStateStorage,
+    saveStateSnapshot,
+    scheduleStateSave,
+    backupForImport: backupCurrentStateForImport,
+};
+
+const ApiModule = {
+    request: apiRequest,
+    checkHealth: checkApiHealth,
+    generateDescription,
+};
+
+const UiModule = {
+    render,
+    startSlider,
+    stopSlider,
+    syncEditableContent,
+    setView,
+};
+
+window.App = {
+    CONFIG,
+    Editor,
+    Catalog: CatalogModule,
+    History: HistoryModule,
+    Storage: StorageModule,
+    Api: ApiModule,
+    Ui: UiModule,
+};
+
 window.setView = setView;
 window.showDetails = showDetails;
 window.addToCart = addToCart;
@@ -4170,4 +4729,15 @@ window.addEventListener('load', () => {
 window.onbeforeunload = () => {
     stopSlider();
 };
+
+// --- Тест-кейсы ---
+// 1. URL "/?edit=1#/catalog" → плавающая кнопка редактирования видна.
+// 2. URL "/#/catalog?edit=1" → кнопка также доступна (параметр читается из hash).
+// 3. Ввод PIN короче 4 символов → система отклоняет ввод и показывает предупреждение.
+// 4. Успешное включение режима → <body> получает класс .editor-mode, а элементы .js-editable становятся contenteditable.
+// 5. Перетаскивание элементов каталога → порядок сохраняется и восстанавливается после перезагрузки страницы.
+// 6. Undo/Redo отражают изменения текста и сортировки (кнопки в панели становятся активными/неактивными корректно).
+// 7. Экспорт JSON → скачивается файл вида site-snapshot-YYYYMMDD-HHMMSS.json с актуальной схемой и временной меткой.
+// 8. Импорт некорректного JSON → показывается понятное сообщение об ошибке, состояние не изменяется.
+// 9. /api/health недоступен → индикатор панели становится красным, запрос к /api/generate с ошибкой показывает сообщение и кнопку «Повторить».
 
