@@ -1,6 +1,36 @@
 <!DOCTYPE html>
 <html lang="ru">
 <head>
+    <!-- latch-edit-flag: фикс потерянного edit при раннем переписывании URL/DOM -->
+    <script>
+        (function () {
+            "use strict";
+            // Истина: edit без значения, или =1/true/on/yes
+            function truthy(v) {
+                if (v == null) return false;
+                v = String(v).trim().toLowerCase();
+                return v === "" || v === "1" || v === "true" || v === "on" || v === "yes";
+            }
+
+            // 1) Ищем edit в location.search
+            var sp = new URLSearchParams(location.search);
+            if (sp.has("edit") && truthy(sp.get("edit"))) {
+                sessionStorage.setItem("editModeRequested", "1");
+                return;
+            }
+
+            // 2) Ищем edit в hash-параметрах, напр. "#/route?edit=1"
+            var h = location.hash || "";
+            var qIndex = h.indexOf("?");
+            if (qIndex !== -1) {
+                var hp = new URLSearchParams(h.slice(qIndex + 1));
+                if (hp.has("edit") && truthy(hp.get("edit"))) {
+                    sessionStorage.setItem("editModeRequested", "1");
+                    return;
+                }
+            }
+        })();
+    </script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>СтройМаркет - Автономный Каталог</title>
@@ -206,6 +236,8 @@
     <script src="catalog.js"></script>
     <!-- Загрузка единого файла логики -->
     <script src="app.js"></script>
+    <!-- Вспомогательный бутстрап редактора -->
+    <script defer src="editor-boot.js"></script>
 
 </body>
 </html>
