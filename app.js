@@ -311,9 +311,32 @@ async function ensureEditorPin({ allowCreate = true } = {}) {
 }
 
 if (!window.editorMode) {
-    const searchParams = new URLSearchParams(window.location.search);
-    const rawFlag = searchParams.get(EDIT_QUERY_PARAM);
-    const isFlagPresent = searchParams.has(EDIT_QUERY_PARAM);
+    const extractEditFlag = () => {
+        const searchParams = new URLSearchParams(window.location.search);
+        if (searchParams.has(EDIT_QUERY_PARAM)) {
+            return {
+                rawValue: searchParams.get(EDIT_QUERY_PARAM),
+                isPresent: true,
+            };
+        }
+
+        const hash = window.location.hash || '';
+        const queryIndex = hash.indexOf('?');
+        if (queryIndex !== -1) {
+            const hashQuery = hash.slice(queryIndex + 1);
+            const hashParams = new URLSearchParams(hashQuery);
+            if (hashParams.has(EDIT_QUERY_PARAM)) {
+                return {
+                    rawValue: hashParams.get(EDIT_QUERY_PARAM),
+                    isPresent: true,
+                };
+            }
+        }
+
+        return { rawValue: null, isPresent: false };
+    };
+
+    const { rawValue: rawFlag, isPresent: isFlagPresent } = extractEditFlag();
     const normalizedFlag = typeof rawFlag === 'string' ? rawFlag.trim().toLowerCase() : null;
     const falsyFlags = new Set(['0', 'false', 'no', 'off', 'disable', 'disabled']);
     const isEnabled = isFlagPresent && !falsyFlags.has(normalizedFlag || '');
