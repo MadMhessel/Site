@@ -1,5 +1,277 @@
 // --- КОНФИГУРАЦИЯ ---
-const APP_ID = 'stroy-market-local'; 
+const STATE_STORAGE_KEY = 'site_state_v1';
+const STATE_BACKUP_PREFIX = 'site_state_backup_';
+const MAX_STATE_BACKUPS = 3;
+const STATE_SAVE_DEBOUNCE = 500;
+const EDITOR_PIN_STORAGE_KEY = 'site_editor_pin_hash';
+const EDITOR_PIN_DIGEST_PREFIX = 'sha256:';
+
+var UNDO_STACK_LIMIT = typeof UNDO_STACK_LIMIT === 'number' ? UNDO_STACK_LIMIT : 50;
+var HISTORY_TRACKED_KEYS = (typeof HISTORY_TRACKED_KEYS !== 'undefined' && HISTORY_TRACKED_KEYS instanceof Set)
+    ? HISTORY_TRACKED_KEYS
+    : new Set();
+['products', 'cartItems', 'slides', 'groupsOrder', 'itemsOrderByGroup', 'checkoutState']
+    .forEach((key) => HISTORY_TRACKED_KEYS.add(key));
+
+var editorHistoryStore = (() => {
+    const scope = typeof window !== 'undefined' ? window : globalThis;
+    if (!scope.__editorHistory) {
+        scope.__editorHistory = {
+            undoStack: [],
+            redoStack: [],
+            activeTextEditKeys: new Set(),
+            isUndoRedoInProgress: false,
+        };
+    }
+    return scope.__editorHistory;
+})();
+
+const activeTextEditKeys = editorHistoryStore.activeTextEditKeys;
+
+const dirtyStateManager = (() => {
+    const scope = typeof window !== 'undefined' ? window : globalThis;
+    const existing = scope.__editorDirtyState;
+    if (existing && typeof existing.markDirty === 'function' && typeof existing.markSaved === 'function' && typeof existing.isDirty === 'function') {
+        if (typeof existing.attachBeforeUnload === 'function') {
+            existing.attachBeforeUnload();
+        }
+        if (typeof window !== 'undefined') {
+            window.isStateDirty = () => existing.isDirty();
+        }
+        return existing;
+    }
+
+    const manager = {
+        generation: 0,
+        lastSavedGeneration: 0,
+        dirty: false,
+        beforeUnloadAttached: false,
+        beforeUnloadHandler: null,
+        markDirty() {
+            manager.generation += 1;
+            manager.dirty = true;
+            manager.attachBeforeUnload();
+            return manager.generation;
+        },
+        markSaved(generation) {
+            if (typeof generation !== 'number') return;
+            if (generation > manager.lastSavedGeneration) {
+                manager.lastSavedGeneration = generation;
+            }
+            if (manager.lastSavedGeneration >= manager.generation && manager.dirty) {
+                manager.dirty = false;
+            }
+        },
+        isDirty() {
+            return manager.dirty;
+        },
+        attachBeforeUnload() {
+            if (manager.beforeUnloadAttached || typeof window === 'undefined') return;
+            const handler = (event) => {
+                if (!manager.dirty) {
+                    return undefined;
+                }
+                event.preventDefault();
+                event.returnValue = '';
+                return '';
+            };
+            window.addEventListener('beforeunload', handler);
+            manager.beforeUnloadAttached = true;
+            manager.beforeUnloadHandler = handler;
+        },
+    };
+
+    scope.__editorDirtyState = manager;
+    if (typeof window !== 'undefined') {
+        window.isStateDirty = () => manager.isDirty();
+    }
+    manager.attachBeforeUnload();
+    return manager;
+})();
+
+const markStateDirty = () => dirtyStateManager.markDirty();
+const markStateSaved = (generation) => dirtyStateManager.markSaved(generation);
+const isStateDirty = () => dirtyStateManager.isDirty();
+
+function updateEditorHistoryButtons() {
+    if (typeof document === 'undefined') return;
+    const editorState = window.editorMode?.state;
+    if (!editorState) return;
+    const canUndo = editorHistoryStore.undoStack.length > 0;
+    const canRedo = editorHistoryStore.redoStack.length > 0;
+    if (editorState.undoButton) {
+        editorState.undoButton.disabled = !canUndo;
+        editorState.undoButton.setAttribute('aria-disabled', String(!canUndo));
+    }
+    if (editorState.redoButton) {
+        editorState.redoButton.disabled = !canRedo;
+        editorState.redoButton.setAttribute('aria-disabled', String(!canRedo));
+    }
+}
+
+function prepareUndoSnapshot() {
+    if (editorHistoryStore.isUndoRedoInProgress) return null;
+    return cloneStateSnapshot();
+}
+
+function commitUndoSnapshot(snapshot) {
+    if (!snapshot) return;
+    editorHistoryStore.undoStack.push(snapshot);
+    if (editorHistoryStore.undoStack.length > UNDO_STACK_LIMIT) {
+        editorHistoryStore.undoStack.splice(0, editorHistoryStore.undoStack.length - UNDO_STACK_LIMIT);
+    }
+    editorHistoryStore.redoStack.length = 0;
+    updateEditorHistoryButtons();
+}
+
+function pushRedoSnapshot(snapshot) {
+    if (!snapshot) return;
+    editorHistoryStore.redoStack.push(snapshot);
+    if (editorHistoryStore.redoStack.length > UNDO_STACK_LIMIT) {
+        editorHistoryStore.redoStack.splice(0, editorHistoryStore.redoStack.length - UNDO_STACK_LIMIT);
+    }
+    updateEditorHistoryButtons();
+}
+
+async function applyHistorySnapshot(snapshot) {
+    if (!snapshot) return;
+    editorHistoryStore.isUndoRedoInProgress = true;
+    activeTextEditKeys.clear();
+    try {
+        state = JSON.parse(JSON.stringify(snapshot));
+        if (typeof window !== 'undefined') {
+            window.state = state;
+        }
+        ensureLayoutOrdering();
+        destroyCatalogSortables();
+        render();
+        await saveStateSnapshot(true);
+    } finally {
+        editorHistoryStore.isUndoRedoInProgress = false;
+        updateEditorHistoryButtons();
+    }
+}
+
+async function undoStateChange() {
+    if (!editorHistoryStore.undoStack.length) return;
+    const previousSnapshot = editorHistoryStore.undoStack.pop();
+    const currentSnapshot = prepareUndoSnapshot();
+    if (currentSnapshot) {
+        pushRedoSnapshot(currentSnapshot);
+    }
+    await applyHistorySnapshot(previousSnapshot);
+}
+
+async function redoStateChange() {
+    if (!editorHistoryStore.redoStack.length) return;
+    const nextSnapshot = editorHistoryStore.redoStack.pop();
+    const currentSnapshot = prepareUndoSnapshot();
+    if (currentSnapshot) {
+        editorHistoryStore.undoStack.push(currentSnapshot);
+        if (editorHistoryStore.undoStack.length > UNDO_STACK_LIMIT) {
+            editorHistoryStore.undoStack.splice(0, editorHistoryStore.undoStack.length - UNDO_STACK_LIMIT);
+        }
+    }
+    await applyHistorySnapshot(nextSnapshot);
+}
+
+function getSafeLocalStorage() {
+    if (typeof window === 'undefined') {
+        return null;
+    }
+    try {
+        return window.localStorage;
+    } catch (error) {
+        console.warn('LocalStorage is not available for editor PIN protection.', error);
+        return null;
+    }
+}
+
+function normalizeEditorPinHash(value) {
+    if (typeof value !== 'string') {
+        return '';
+    }
+    return value.startsWith(EDITOR_PIN_DIGEST_PREFIX)
+        ? value.slice(EDITOR_PIN_DIGEST_PREFIX.length)
+        : value;
+}
+
+async function hashEditorPin(pin) {
+    const normalized = typeof pin === 'string' ? pin.trim() : '';
+    if (!normalized) {
+        return null;
+    }
+    if (typeof window !== 'undefined' && window.crypto?.subtle && typeof TextEncoder !== 'undefined') {
+        const encoder = new TextEncoder();
+        const data = encoder.encode(normalized);
+        const digest = await window.crypto.subtle.digest('SHA-256', data);
+        const hashArray = Array.from(new Uint8Array(digest));
+        const hex = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+        return `${EDITOR_PIN_DIGEST_PREFIX}${hex}`;
+    }
+
+    let hash = 0;
+    for (let index = 0; index < normalized.length; index += 1) {
+        hash = ((hash << 5) - hash) + normalized.charCodeAt(index);
+        hash |= 0; // eslint-disable-line no-bitwise
+    }
+    const fallbackHex = Math.abs(hash).toString(16);
+    return `${EDITOR_PIN_DIGEST_PREFIX}${fallbackHex}`;
+}
+
+async function ensureEditorPin({ allowCreate = true } = {}) {
+    if (typeof window === 'undefined') {
+        return false;
+    }
+
+    const storage = getSafeLocalStorage();
+    if (!storage) {
+        return window.confirm('Локальное хранилище недоступно. Продолжить без проверки PIN?');
+    }
+
+    const storedHash = storage.getItem(EDITOR_PIN_STORAGE_KEY);
+    if (!storedHash) {
+        if (!allowCreate) {
+            return false;
+        }
+        const shouldCreate = window.confirm('Для работы редактора необходимо создать локальный PIN. Продолжить?');
+        if (!shouldCreate) {
+            return false;
+        }
+        const firstPin = window.prompt('Введите новый PIN (минимум 4 символа):');
+        if (!firstPin || firstPin.trim().length < 4) {
+            window.alert('PIN должен содержать минимум 4 символа.');
+            return false;
+        }
+        const confirmation = window.prompt('Повторите PIN для подтверждения:');
+        if (confirmation !== firstPin) {
+            window.alert('PIN не совпадает.');
+            return false;
+        }
+        const hashed = await hashEditorPin(firstPin);
+        if (!hashed) {
+            window.alert('Не удалось сохранить PIN. Попробуйте снова.');
+            return false;
+        }
+        storage.setItem(EDITOR_PIN_STORAGE_KEY, hashed);
+        return true;
+    }
+
+    const pin = window.prompt('Введите PIN редактора:');
+    if (pin === null) {
+        return false;
+    }
+    const hashed = await hashEditorPin(pin);
+    if (!hashed) {
+        window.alert('PIN не может быть пустым.');
+        return false;
+    }
+    if (normalizeEditorPinHash(hashed) === normalizeEditorPinHash(storedHash)) {
+        return true;
+    }
+    window.alert('Неверный PIN.');
+    return false;
+}
 
 // LLM API Configuration (для генерации описаний)
 const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=';
@@ -9,54 +281,861 @@ const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/
 const GEMINI_API_KEY = ""; 
 // ---------------------
 
-// --- Глобальное Состояние ---
-let appState = {
-    products: [],
-    cartItems: {}, // { productId: { quantity, name, price, unit } }
-    view: 'home', // 'home', 'cart', 'admin', 'details'
-    selectedProductId: null, // ID для детальной страницы
-    message: ''
+const DEFAULT_PRODUCTS = [
+    {
+        id: 'demo-1',
+        name: 'Пеноблок D600 (600x200x300)',
+        price: 350,
+        unit: 'шт',
+        description: 'Легкий и прочный пеноблок для строительства наружных стен и перегородок. Высокие теплоизоляционные свойства.',
+        image: 'https://placehold.co/400x160/2563eb/ffffff?text=Material',
+    },
+];
+
+function createDefaultRenderState() {
+    return {
+        texts: {},
+        groups: { catalogCategories: [] },
+        items: {
+            products: DEFAULT_PRODUCTS.map((product) => ({ ...product })),
+            cartItems: {},
+        },
+        layout: {
+            view: 'home',
+            selectedProductId: null,
+            lastViewBeforeDetails: 'home',
+            groupsOrder: [],
+            itemsOrderByGroup: {},
+        },
+        meta: {
+            message: '',
+            searchTerm: '',
+            sortBy: 'name-asc',
+            onlyWithPrice: false,
+        },
+    };
+}
+
+const sharedState = typeof window !== 'undefined' && window.state ? window.state : null;
+let state = sharedState ? window.state : createDefaultRenderState();
+if (!sharedState && typeof window !== 'undefined') {
+    window.state = state;
+}
+
+let localStateSaveTimeoutId = null;
+let localforageLoaderPromise = null;
+
+const LOCAL_STATE_KEY_PATHS = {
+    products: ['items', 'products'],
+    cartItems: ['items', 'cartItems'],
+    view: ['layout', 'view'],
+    selectedProductId: ['layout', 'selectedProductId'],
+    lastViewBeforeDetails: ['layout', 'lastViewBeforeDetails'],
+    groupsOrder: ['layout', 'groupsOrder'],
+    itemsOrderByGroup: ['layout', 'itemsOrderByGroup'],
+    message: ['meta', 'message'],
 };
 
-// Внутреннее состояние формы администратора (для сохранения введенных данных)
-window.adminState = {
-    productName: '', productPrice: '', productUnit: 'шт', 
-    productImage: 'https://placehold.co/400x160/2563eb/ffffff?text=Material', 
-    productDescription: '', isGenerating: false, jsonInput: '',
-};
+const applyStatePatch = typeof window !== 'undefined' && typeof window.applyStatePatch === 'function'
+    ? window.applyStatePatch
+    : function renderApplyStatePatch(partial = {}) {
+        const changedKeys = [];
+        for (const [key, value] of Object.entries(partial)) {
+            const path = LOCAL_STATE_KEY_PATHS[key];
+            if (!path) continue;
+            let target = state;
+            for (let i = 0; i < path.length - 1; i += 1) {
+                if (!target[path[i]]) {
+                    target[path[i]] = {};
+                }
+                target = target[path[i]];
+            }
+            const lastKey = path[path.length - 1];
+            const previous = target[lastKey];
+            const hasChanged = JSON.stringify(previous) !== JSON.stringify(value);
+            if (hasChanged) {
+                target[lastKey] = value;
+                changedKeys.push(key);
+            }
+        }
+        return changedKeys;
+    };
 
-// --- Утилиты для работы с localStorage ---
+const computeEditorKey = typeof window !== 'undefined' && typeof window.computeEditorKey === 'function'
+    ? window.computeEditorKey
+    : function renderComputeEditorKey(element) {
+        if (!element || typeof element !== 'object' || typeof document === 'undefined') return null;
+        if (element.dataset && element.dataset.editKey) {
+            return element.dataset.editKey;
+        }
+        const segments = [];
+        let node = element;
+        while (node && node !== document.body) {
+            let index = 0;
+            let sibling = node.previousElementSibling;
+            while (sibling) {
+                if (sibling.tagName === node.tagName) {
+                    index += 1;
+                }
+                sibling = sibling.previousElementSibling;
+            }
+            segments.unshift(`${node.tagName.toLowerCase()}:${index}`);
+            node = node.parentElement;
+        }
+        const key = segments.join('/');
+        if (element.dataset) {
+            element.dataset.editKey = key;
+        }
+        return key;
+    };
 
-function loadState() {
-    const storedProducts = localStorage.getItem(`${APP_ID}_products`);
-    const storedCart = localStorage.getItem(`${APP_ID}_cart`);
-    
-    if (storedProducts) {
-        appState.products = JSON.parse(storedProducts);
-    } else {
-        appState.products = [{
-            id: 'demo-1', name: 'Пеноблок D600 (600x200x300)', price: 350, unit: 'шт', 
-            description: 'Легкий и прочный пеноблок для строительства наружных стен и перегородок. Высокие теплоизоляционные свойства. Идеально подходит для малоэтажного и частного строительства, обеспечивая отличную звукоизоляцию и минимальные теплопотери.',
-            image: 'https://placehold.co/400x160/2563eb/ffffff?text=Пеноблок'
-        }];
-    }
+const syncEditableContent = typeof window !== 'undefined' && typeof window.syncEditableContent === 'function'
+    ? window.syncEditableContent
+    : function renderSyncEditableContent({ captureMissing = false } = {}) {
+        if (typeof document === 'undefined') return false;
+        const elements = document.querySelectorAll('.js-editable');
+        let stateChanged = false;
+        elements.forEach((element) => {
+            const key = computeEditorKey(element);
+            if (!key) return;
+            if (captureMissing && !Object.prototype.hasOwnProperty.call(state.texts, key)) {
+                state.texts[key] = element.textContent ?? '';
+                stateChanged = true;
+            }
+            if (Object.prototype.hasOwnProperty.call(state.texts, key)) {
+                const storedText = state.texts[key];
+                if (element.textContent !== storedText) {
+                    element.textContent = storedText;
+                }
+            }
+        });
+        if (stateChanged) {
+            scheduleStateSave();
+        }
+        return stateChanged;
+    };
 
-    if (storedCart) {
-        appState.cartItems = JSON.parse(storedCart);
+function cloneStateSnapshot() {
+    return JSON.parse(JSON.stringify(state));
+}
+
+function buildStateExportFileName() {
+    const now = new Date();
+    const pad = (value) => String(value).padStart(2, '0');
+    return `site-state-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}.json`;
+}
+
+function downloadJsonFile(fileName, jsonString) {
+    if (typeof document === 'undefined' || !document.body) return;
+    const blob = new Blob([jsonString], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = fileName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
+}
+
+function exportStateSnapshot() {
+    try {
+        const snapshot = cloneStateSnapshot();
+        const jsonString = JSON.stringify(snapshot, null, 2);
+        downloadJsonFile(buildStateExportFileName(), jsonString);
+    } catch (error) {
+        console.error('[EDITOR:EXPORT]', error);
+        setMessage('Не удалось экспортировать состояние.');
     }
 }
 
-function saveState() {
-    localStorage.setItem(`${APP_ID}_products`, JSON.stringify(appState.products));
-    localStorage.setItem(`${APP_ID}_cart`, JSON.stringify(appState.cartItems));
+function validateImportedSnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') {
+        throw new Error('Некорректный JSON-файл.');
+    }
+    const requiredKeys = ['items', 'groups', 'layout', 'texts'];
+    const missing = requiredKeys.filter((key) => !Object.prototype.hasOwnProperty.call(snapshot, key));
+    if (missing.length) {
+        throw new Error(`Отсутствуют обязательные поля: ${missing.join(', ')}`);
+    }
+    if (typeof snapshot.items !== 'object' || snapshot.items === null) {
+        throw new Error('Поле "items" должно быть объектом.');
+    }
+    if (typeof snapshot.groups !== 'object' || snapshot.groups === null) {
+        throw new Error('Поле "groups" должно быть объектом.');
+    }
+    if (typeof snapshot.layout !== 'object' || snapshot.layout === null) {
+        throw new Error('Поле "layout" должно быть объектом.');
+    }
+    if (typeof snapshot.texts !== 'object' || snapshot.texts === null) {
+        throw new Error('Поле "texts" должно быть объектом.');
+    }
+    return snapshot;
+}
+
+function mergeImportedRenderState(defaultState, importedState) {
+    const merged = createDefaultRenderState();
+    const snapshot = importedState && typeof importedState === 'object' ? importedState : {};
+    merged.texts = { ...merged.texts, ...(snapshot.texts || {}) };
+    const catalogCategories = Array.isArray(snapshot.groups?.catalogCategories)
+        ? snapshot.groups.catalogCategories.map((category) => ({ ...category }))
+        : defaultState.groups.catalogCategories.map((category) => ({ ...category }));
+    merged.groups = {
+        ...merged.groups,
+        ...(snapshot.groups || {}),
+        catalogCategories,
+    };
+    merged.items = {
+        ...merged.items,
+        ...(snapshot.items || {}),
+        products: Array.isArray(snapshot.items?.products)
+            ? snapshot.items.products.map((product) => ({ ...product }))
+            : defaultState.items.products.map((product) => ({ ...product })),
+        cartItems: snapshot.items?.cartItems
+            ? { ...snapshot.items.cartItems }
+            : { ...defaultState.items.cartItems },
+    };
+    merged.layout = {
+        ...merged.layout,
+        ...(snapshot.layout || {}),
+    };
+    merged.meta = {
+        ...merged.meta,
+        ...(snapshot.meta || {}),
+    };
+    return merged;
+}
+
+async function applyImportedSnapshot(importedState) {
+    const defaults = createDefaultRenderState();
+    const merged = mergeImportedRenderState(defaults, importedState);
+
+    if (!Array.isArray(merged.items.products) || !merged.items.products.length) {
+        merged.items.products = defaults.items.products.map((product) => ({ ...product }));
+    }
+
+    const undoSnapshot = prepareUndoSnapshot();
+    state = merged;
+    if (typeof window !== 'undefined') {
+        window.state = state;
+    }
+
+    activeTextEditKeys.clear();
+    commitUndoSnapshot(undoSnapshot);
+
+    ensureLayoutOrdering();
+
+    if (localStateSaveTimeoutId) {
+        clearTimeout(localStateSaveTimeoutId);
+        localStateSaveTimeoutId = null;
+    }
+
+    destroyCatalogSortables();
+    render();
+    await saveStateSnapshot(true);
+    setMessage('Состояние успешно импортировано.');
+}
+
+async function importStateFromFile(file) {
+    try {
+        const text = await file.text();
+        const parsed = JSON.parse(text);
+        const snapshot = validateImportedSnapshot(parsed);
+        await applyImportedSnapshot(snapshot);
+    } catch (error) {
+        console.error('[EDITOR:IMPORT]', error);
+        setMessage(`Ошибка импорта: ${error.message}`);
+    }
+}
+
+function arraysEqual(first, second) {
+    if (first === second) return true;
+    if (!Array.isArray(first) || !Array.isArray(second)) return false;
+    if (first.length !== second.length) return false;
+    for (let index = 0; index < first.length; index += 1) {
+        if (first[index] !== second[index]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function ensureLayoutOrdering({ persist = false } = {}) {
+    const categories = Array.isArray(state.groups?.catalogCategories)
+        ? state.groups.catalogCategories
+        : [];
+    const categorySlugs = categories
+        .map((category) => String(category?.slug || '').trim())
+        .filter(Boolean);
+    const currentGroupOrder = Array.isArray(state.layout?.groupsOrder) ? state.layout.groupsOrder : [];
+    const sanitizedGroupOrder = currentGroupOrder.filter((slug) => categorySlugs.includes(slug));
+    let groupsChanged = sanitizedGroupOrder.length !== currentGroupOrder.length;
+    categorySlugs.forEach((slug) => {
+        if (!sanitizedGroupOrder.includes(slug)) {
+            sanitizedGroupOrder.push(slug);
+            groupsChanged = true;
+        }
+    });
+
+    const currentItemsOrder = state.layout?.itemsOrderByGroup && typeof state.layout.itemsOrderByGroup === 'object'
+        ? state.layout.itemsOrderByGroup
+        : {};
+    const nextItemsOrder = {};
+    let itemsChanged = false;
+
+    categories.forEach((category) => {
+        const groupSlug = String(category?.slug || '').trim();
+        if (!groupSlug) return;
+        const subcategorySlugs = Array.isArray(category?.subcategories)
+            ? category.subcategories.map((sub) => String(sub?.slug || '').trim()).filter(Boolean)
+            : [];
+        const savedOrder = Array.isArray(currentItemsOrder[groupSlug]) ? currentItemsOrder[groupSlug] : [];
+        const sanitizedItems = savedOrder.filter((slug) => subcategorySlugs.includes(slug));
+        if (sanitizedItems.length !== savedOrder.length) {
+            itemsChanged = true;
+        }
+        subcategorySlugs.forEach((slug) => {
+            if (!sanitizedItems.includes(slug)) {
+                sanitizedItems.push(slug);
+                itemsChanged = true;
+            }
+        });
+        nextItemsOrder[groupSlug] = sanitizedItems;
+    });
+
+    const existingGroupKeys = Object.keys(currentItemsOrder);
+    const nextGroupKeys = Object.keys(nextItemsOrder);
+    if (!itemsChanged && existingGroupKeys.length !== nextGroupKeys.length) {
+        itemsChanged = true;
+    }
+    if (!itemsChanged) {
+        itemsChanged = nextGroupKeys.some((key) => !arraysEqual(currentItemsOrder[key] || [], nextItemsOrder[key] || []));
+    }
+
+    if (!arraysEqual(sanitizedGroupOrder, state.layout.groupsOrder || [])) {
+        groupsChanged = true;
+    }
+
+    if (groupsChanged) {
+        state.layout.groupsOrder = sanitizedGroupOrder;
+    }
+    if (itemsChanged) {
+        state.layout.itemsOrderByGroup = nextItemsOrder;
+    }
+
+    if ((groupsChanged || itemsChanged) && persist) {
+        scheduleStateSave();
+    }
+
+    return groupsChanged || itemsChanged;
+}
+
+let catalogGroupsSortable = null;
+const catalogItemSortables = new Map();
+
+function destroyCatalogSortables() {
+    if (catalogGroupsSortable) {
+        catalogGroupsSortable.destroy();
+        catalogGroupsSortable = null;
+    }
+    catalogItemSortables.forEach((instance) => instance.destroy());
+    catalogItemSortables.clear();
+}
+
+function refreshCatalogSortables() {
+    if (typeof document === 'undefined') return;
+    const editorState = window.editorMode?.state;
+    const isEditorActive = Boolean(editorState?.isEnabled && editorState.isActive);
+    if (!isEditorActive || typeof Sortable === 'undefined' || state.layout.view !== 'catalog') {
+        destroyCatalogSortables();
+        return;
+    }
+
+    const groupsContainer = document.querySelector('[data-groups-container="catalog"]');
+    if (!groupsContainer) {
+        destroyCatalogSortables();
+        return;
+    }
+
+    destroyCatalogSortables();
+
+    catalogGroupsSortable = new Sortable(groupsContainer, {
+        animation: 150,
+        handle: '.js-drag',
+        fallbackOnBody: true,
+        draggable: '[data-group-id]',
+        onEnd: () => {
+            const nextOrder = Array.from(groupsContainer.querySelectorAll('[data-group-id]'))
+                .map((element) => element.getAttribute('data-group-id'))
+                .filter(Boolean);
+            if (!arraysEqual(nextOrder, state.layout.groupsOrder || [])) {
+                setState({ groupsOrder: nextOrder });
+            }
+        },
+    });
+
+    const itemsContainers = groupsContainer.querySelectorAll('[data-items-container]');
+    itemsContainers.forEach((container) => {
+        const groupId = container.getAttribute('data-items-container');
+        if (!groupId) return;
+        const sortableInstance = new Sortable(container, {
+            animation: 150,
+            handle: '.js-drag',
+            fallbackOnBody: true,
+            draggable: '[data-item-id]',
+            onEnd: () => {
+                const nextItemsOrder = Array.from(container.querySelectorAll('[data-item-id]'))
+                    .map((element) => element.getAttribute('data-item-id'))
+                    .filter(Boolean);
+                const currentOrder = state.layout.itemsOrderByGroup?.[groupId] || [];
+                if (!arraysEqual(nextItemsOrder, currentOrder)) {
+                    const existing = state.layout.itemsOrderByGroup && typeof state.layout.itemsOrderByGroup === 'object'
+                        ? state.layout.itemsOrderByGroup
+                        : {};
+                    setState({ itemsOrderByGroup: { ...existing, [groupId]: nextItemsOrder } });
+                }
+            },
+        });
+        catalogItemSortables.set(groupId, sortableInstance);
+    });
+}
+
+const ensureLocalforage = typeof window !== 'undefined' && window.ensureLocalforage
+    ? window.ensureLocalforage
+    : function renderEnsureLocalforage() {
+        if (typeof window !== 'undefined' && window.localforage) {
+            return Promise.resolve(window.localforage);
+        }
+        if (localforageLoaderPromise) {
+            return localforageLoaderPromise;
+        }
+        if (typeof document === 'undefined') {
+            return Promise.resolve(null);
+        }
+        localforageLoaderPromise = new Promise((resolve) => {
+            const script = document.createElement('script');
+            script.src = 'https://cdn.jsdelivr.net/npm/localforage@1.10.0/dist/localforage.min.js';
+            script.async = true;
+            script.onload = () => resolve(window.localforage || null);
+            script.onerror = () => {
+                console.warn('[STATE:SKIP]', 'render-storage', 'Не удалось загрузить localForage');
+                resolve(null);
+            };
+            document.head.appendChild(script);
+        });
+        return localforageLoaderPromise;
+    };
+
+const scheduleStateSave = typeof window !== 'undefined' && typeof window.scheduleStateSave === 'function'
+    ? window.scheduleStateSave
+    : function renderScheduleStateSave() {
+        return saveStateSnapshot();
+    };
+
+async function saveStateSnapshot(immediate = false) {
+    const generation = markStateDirty();
+    const lf = await ensureLocalforage();
+    if (!lf) return;
+    const persist = async () => {
+        try {
+            const current = await lf.getItem(STATE_STORAGE_KEY);
+            if (current) {
+                const backupKey = `${STATE_BACKUP_PREFIX}${Date.now()}`;
+                await lf.setItem(backupKey, current);
+                const keys = await lf.keys();
+                const backups = keys.filter((key) => key.startsWith(STATE_BACKUP_PREFIX));
+                if (backups.length > MAX_STATE_BACKUPS) {
+                    const sorted = backups.sort((a, b) => b.localeCompare(a));
+                    const excess = sorted.slice(MAX_STATE_BACKUPS);
+                    await Promise.all(excess.map((key) => lf.removeItem(key)));
+                }
+            }
+            await lf.setItem(STATE_STORAGE_KEY, JSON.parse(JSON.stringify(state)));
+            markStateSaved(generation);
+        } catch (error) {
+            console.warn('[STATE:SKIP]', 'render-storage', `Не удалось сохранить состояние: ${error.message}`);
+        }
+    };
+    if (immediate) {
+        if (localStateSaveTimeoutId) {
+            clearTimeout(localStateSaveTimeoutId);
+            localStateSaveTimeoutId = null;
+        }
+        await persist();
+        return;
+    }
+    if (localStateSaveTimeoutId) {
+        clearTimeout(localStateSaveTimeoutId);
+    }
+    localStateSaveTimeoutId = window.setTimeout(() => {
+        localStateSaveTimeoutId = null;
+        persist();
+    }, STATE_SAVE_DEBOUNCE);
+}
+
+const initializeState = typeof window !== 'undefined' && typeof window.initializeSiteState === 'function'
+    ? window.initializeSiteState
+    : async function renderInitializeState() {
+        const lf = await ensureLocalforage();
+        const defaults = createDefaultRenderState();
+        if (lf) {
+            try {
+                const stored = await lf.getItem(STATE_STORAGE_KEY);
+                if (stored && typeof stored === 'object') {
+                    state = {
+                        ...defaults,
+                        ...stored,
+                        items: {
+                            ...defaults.items,
+                            ...(stored.items || {}),
+                        },
+                        layout: {
+                            ...defaults.layout,
+                            ...(stored.layout || {}),
+                        },
+                        meta: {
+                            ...defaults.meta,
+                            ...(stored.meta || {}),
+                        },
+                    };
+                    if (typeof window !== 'undefined') {
+                        window.state = state;
+                    }
+                }
+            } catch (error) {
+                console.warn('[STATE:SKIP]', 'render-storage', `Не удалось загрузить состояние: ${error.message}`);
+            }
+        }
+        if (!state.items.products.length) {
+            state.items.products = defaults.items.products.map((product) => ({ ...product }));
+        }
+        ensureLayoutOrdering({ persist: true });
+        if (lf) {
+            await saveStateSnapshot(true);
+        }
+    };
+
+if (typeof document !== 'undefined') {
+    const globalObject = typeof window !== 'undefined' ? window : null;
+    if (!globalObject || !globalObject.__editorChangeListenerAttached) {
+        document.addEventListener('editor:changed', (event) => {
+            const element = event?.target;
+            if (!element || typeof element !== 'object') return;
+            const key = computeEditorKey(element);
+            if (!key) return;
+            const text = element.textContent ?? '';
+            const trigger = event?.detail?.trigger || null;
+            const previousText = state.texts[key];
+
+            if (previousText === text) {
+                if (trigger === 'blur') {
+                    activeTextEditKeys.delete(key);
+                }
+                return;
+            }
+
+            if (!activeTextEditKeys.has(key)) {
+                const snapshot = prepareUndoSnapshot();
+                commitUndoSnapshot(snapshot);
+                activeTextEditKeys.add(key);
+            }
+
+            state.texts[key] = text;
+            scheduleStateSave();
+
+            if (trigger === 'blur') {
+                activeTextEditKeys.delete(key);
+            }
+        });
+        if (globalObject) {
+            globalObject.__editorChangeListenerAttached = true;
+        }
+    }
+}
+
+if (typeof window !== 'undefined') {
+    if (!window.applyStatePatch) window.applyStatePatch = applyStatePatch;
+    if (!window.scheduleStateSave) window.scheduleStateSave = scheduleStateSave;
+    if (!window.syncEditableContent) window.syncEditableContent = syncEditableContent;
+    if (!window.computeEditorKey) window.computeEditorKey = computeEditorKey;
+    if (!window.initializeSiteState) window.initializeSiteState = initializeState;
+    if (!window.isStateDirty) window.isStateDirty = isStateDirty;
+}
+
+// Внутреннее состояние формы администратора (для сохранения введенных данных)
+window.adminState = {
+    productName: '', productPrice: '', productUnit: 'шт',
+    productImage: 'https://placehold.co/400x160/2563eb/ffffff?text=Material',
+    productDescription: '', isGenerating: false, jsonInput: '',
+};
+
+const EDIT_QUERY_PARAM = 'edit';
+
+if (!window.editorMode) {
+    const searchParams = new URLSearchParams(window.location.search);
+    const isEnabled = searchParams.get(EDIT_QUERY_PARAM) === '1';
+    const handlers = new WeakMap();
+    const documentAvailable = typeof document !== 'undefined';
+    const getBodyElement = () => (documentAvailable ? document.body : null);
+    const state = {
+        isEnabled,
+        isActive: false,
+        isAuthorized: false,
+        authorizationPromise: null,
+        button: null,
+        initialized: false,
+        handlers,
+        panel: null,
+        panelInitialized: false,
+        exportButton: null,
+        importButton: null,
+        importInput: null,
+        undoButton: null,
+        redoButton: null,
+    };
+
+    const initialBody = getBodyElement();
+    if (initialBody) {
+        initialBody.classList.toggle('editor-mode', state.isActive);
+    }
+
+    const emitEditorChanged = (element, trigger) => {
+        const text = element.textContent ?? '';
+        element.textContent = text;
+        if (typeof computeEditorKey === 'function') {
+            computeEditorKey(element);
+        }
+        element.dispatchEvent(new CustomEvent('editor:changed', {
+            bubbles: true,
+            detail: { text, trigger },
+        }));
+    };
+
+    const detachHandler = (element) => {
+        const handler = state.handlers.get(element);
+        if (!handler) return;
+        element.removeEventListener('input', handler);
+        element.removeEventListener('blur', handler);
+        state.handlers.delete(element);
+    };
+
+    const createHandler = (element) => (event) => {
+        emitEditorChanged(element, event.type);
+    };
+
+    const updatePanelVisibility = () => {
+        if (!state.panel) return;
+        const shouldShow = state.isEnabled && state.isActive;
+        state.panel.style.display = shouldShow ? 'flex' : 'none';
+        state.panel.setAttribute('aria-hidden', shouldShow ? 'false' : 'true');
+    };
+
+    const initializeEditorPanel = () => {
+        if (!documentAvailable || state.panelInitialized) return;
+        const panel = document.getElementById('editor-panel');
+        if (!panel) return;
+
+        const undoButton = panel.querySelector('[data-editor-action="undo"]');
+        const redoButton = panel.querySelector('[data-editor-action="redo"]');
+        const exportButton = panel.querySelector('[data-editor-action="export"]');
+        const importButton = panel.querySelector('[data-editor-action="import"]');
+        const importInput = document.getElementById('editor-import-input')
+            || panel.querySelector('input[type="file"]');
+
+        if (undoButton) {
+            undoButton.addEventListener('click', () => {
+                if (!state.isEnabled || !state.isActive) return;
+                undoStateChange();
+            });
+        }
+
+        if (redoButton) {
+            redoButton.addEventListener('click', () => {
+                if (!state.isEnabled || !state.isActive) return;
+                redoStateChange();
+            });
+        }
+
+        if (exportButton) {
+            exportButton.addEventListener('click', () => {
+                if (!state.isEnabled || !state.isActive) return;
+                exportStateSnapshot();
+            });
+        }
+
+        if (importButton && importInput) {
+            importButton.addEventListener('click', () => {
+                if (!state.isEnabled || !state.isActive) return;
+                if (typeof window !== 'undefined') {
+                    const confirmed = window.confirm('Импорт заменит текущее состояние. Продолжить?');
+                    if (!confirmed) return;
+                }
+                importInput.value = '';
+                importInput.click();
+            });
+
+            importInput.addEventListener('change', async (event) => {
+                const input = event.target;
+                const selectedFile = input.files && input.files[0];
+                if (selectedFile) {
+                    await importStateFromFile(selectedFile);
+                }
+                input.value = '';
+            });
+        }
+
+        state.panel = panel;
+        state.exportButton = exportButton;
+        state.importButton = importButton;
+        state.importInput = importInput;
+        state.undoButton = undoButton;
+        state.redoButton = redoButton;
+        state.panelInitialized = true;
+        updatePanelVisibility();
+        updateEditorHistoryButtons();
+    };
+
+    const applyEditableState = () => {
+        if (!documentAvailable) return;
+        initializeEditorPanel();
+        const elements = document.querySelectorAll('.js-editable');
+        elements.forEach((element) => {
+            const handler = state.handlers.get(element);
+            if (!state.isEnabled || !state.isActive) {
+                if (handler) {
+                    detachHandler(element);
+                }
+                if (element.hasAttribute('contenteditable')) {
+                    element.removeAttribute('contenteditable');
+                }
+                return;
+            }
+
+            if (!handler) {
+                const listener = createHandler(element);
+                element.addEventListener('input', listener);
+                element.addEventListener('blur', listener);
+                state.handlers.set(element, listener);
+            }
+
+            if (typeof computeEditorKey === 'function') {
+                computeEditorKey(element);
+            }
+            element.setAttribute('contenteditable', 'plaintext-only');
+        });
+        updatePanelVisibility();
+        refreshCatalogSortables();
+    };
+
+    const updateButtonState = () => {
+        if (!state.button) return;
+        const label = state.isActive ? 'Завершить редактирование' : 'Редактировать';
+        state.button.textContent = label;
+        state.button.setAttribute('aria-pressed', String(state.isActive));
+        state.button.setAttribute('aria-label', state.isActive ? 'Выключить режим редактирования' : 'Включить режим редактирования');
+    };
+
+    const updateBodyClass = () => {
+        const body = getBodyElement();
+        if (body) {
+            body.classList.toggle('editor-mode', Boolean(state.isEnabled && state.isActive));
+        }
+    };
+
+    const requestEditorAuthorization = async () => {
+        if (state.isAuthorized) {
+            return true;
+        }
+        if (state.authorizationPromise) {
+            return state.authorizationPromise;
+        }
+        const promise = ensureEditorPin({ allowCreate: true }).then((authorized) => {
+            state.authorizationPromise = null;
+            if (authorized) {
+                state.isAuthorized = true;
+            }
+            return authorized;
+        });
+        state.authorizationPromise = promise;
+        return promise;
+    };
+
+    const setupEditorButton = () => {
+        if (state.initialized) {
+            updateButtonState();
+            updateBodyClass();
+            applyEditableState();
+            return;
+        }
+
+        state.initialized = true;
+        state.button = documentAvailable ? document.getElementById('editor-toggle') : null;
+        initializeEditorPanel();
+
+        if (!state.button) {
+            applyEditableState();
+            return;
+        }
+
+        if (!state.isEnabled) {
+            state.button.style.display = 'none';
+            state.isActive = false;
+            state.isAuthorized = false;
+            state.authorizationPromise = null;
+            const body = getBodyElement();
+            if (body) {
+                body.classList.remove('editor-mode');
+            }
+            updatePanelVisibility();
+            updateBodyClass();
+            applyEditableState();
+            return;
+        }
+
+        state.button.style.display = 'block';
+        updateButtonState();
+        updateBodyClass();
+
+        state.button.addEventListener('click', async () => {
+            if (!state.isActive) {
+                const authorized = await requestEditorAuthorization();
+                if (!authorized) {
+                    return;
+                }
+                state.isActive = true;
+            } else {
+                state.isActive = false;
+            }
+            updateBodyClass();
+            updateButtonState();
+            applyEditableState();
+        });
+
+        applyEditableState();
+    };
+
+    window.editorMode = {
+        state,
+        refresh: applyEditableState,
+        setup: setupEditorButton,
+    };
+    updateEditorHistoryButtons();
 }
 
 // --- Управление Состоянием (ГЛОБАЛЬНЫЕ ФУНКЦИИ) ---
 
 function setState(newState, callback = null) {
-    Object.assign(appState, newState);
-    saveState(); 
-    render(); 
+    const undoSnapshot = prepareUndoSnapshot();
+    const changedKeys = applyStatePatch(newState || {});
+    if (!changedKeys.length) {
+        if (callback) callback();
+        return;
+    }
+    if (changedKeys.some((key) => HISTORY_TRACKED_KEYS.has(key))) {
+        commitUndoSnapshot(undoSnapshot);
+    }
+    scheduleStateSave();
+    render();
     if (callback) callback();
 }
 
@@ -66,11 +1145,22 @@ function setMessage(text) {
 }
 
 function setView(newView) {
-    setState({ view: newView, selectedProductId: null, message: '' });
+    const patch = { view: newView, selectedProductId: null, message: '' };
+    if (newView !== 'details') {
+        patch.lastViewBeforeDetails = newView;
+    }
+    setState(patch);
 }
 
 function showDetails(productId) {
-    setState({ view: 'details', selectedProductId: productId });
+    const patch = {
+        view: 'details',
+        selectedProductId: productId,
+    };
+    if (state.layout.view !== 'details') {
+        patch.lastViewBeforeDetails = state.layout.view;
+    }
+    setState(patch);
 }
 
 // --- Утилиты Расчетов ---
@@ -80,19 +1170,89 @@ function formatCurrency(amount) {
 }
 
 function calculateTotalCost() {
-    return Object.values(appState.cartItems).reduce((sum, item) => 
+    return Object.values(state.items.cartItems).reduce((sum, item) => 
         sum + (item.quantity * item.price), 0);
 }
 
 function calculateCartCount() {
-    return Object.values(appState.cartItems).reduce((sum, item) => sum + item.quantity, 0);
+    return Object.values(state.items.cartItems).reduce((sum, item) => sum + item.quantity, 0);
+}
+
+function readFileAsDataUrl(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error('Не удалось прочитать файл.'));
+        reader.readAsDataURL(file);
+    });
+}
+
+function applyProductImageDataUrl(productId, dataUrl) {
+    if (!productId || typeof dataUrl !== 'string') {
+        return;
+    }
+    const productIndex = state.items.products.findIndex((product) => product.id === productId);
+    if (productIndex === -1) {
+        setMessage('Товар не найден. Обновление изображения невозможно.');
+        return;
+    }
+
+    const undoSnapshot = prepareUndoSnapshot();
+    const updatedProducts = [...state.items.products];
+    updatedProducts[productIndex] = {
+        ...updatedProducts[productIndex],
+        image: dataUrl,
+    };
+    state.items.products = updatedProducts;
+
+    const storedItem = state.items[productId] && typeof state.items[productId] === 'object'
+        ? { ...state.items[productId] }
+        : {};
+    storedItem.img = dataUrl;
+    state.items[productId] = storedItem;
+
+    if (undoSnapshot) {
+        commitUndoSnapshot(undoSnapshot);
+    }
+
+    scheduleStateSave();
+    setMessage('Фото товара обновлено. Размер сохранённого состояния увеличится из-за хранения dataURL.');
+}
+
+async function handleProductImageReplace(event, productId) {
+    if (event && typeof event.stopPropagation === 'function') {
+        event.stopPropagation();
+    }
+    const input = event?.target;
+    if (!input || !productId) return;
+
+    const file = input.files && input.files[0];
+    input.value = '';
+    if (!file) return;
+
+    if (file.type && !file.type.startsWith('image/')) {
+        setMessage('Пожалуйста, выберите файл изображения.');
+        return;
+    }
+
+    try {
+        const dataUrl = await readFileAsDataUrl(file);
+        if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image')) {
+            setMessage('Не удалось получить dataURL изображения.');
+            return;
+        }
+        applyProductImageDataUrl(productId, dataUrl);
+    } catch (error) {
+        console.error('[EDITOR:IMAGE]', error);
+        setMessage('Не удалось загрузить изображение. Попробуйте другой файл.');
+    }
 }
 
 // --- Функции Корзины (ГЛОБАЛЬНЫЕ) ---
 
 function updateCartItemQuantity(productId, change) {
-    const currentItem = appState.cartItems[productId] || {};
-    const product = appState.products.find(p => p.id === productId);
+    const currentItem = state.items.cartItems[productId] || {};
+    const product = state.items.products.find(p => p.id === productId);
 
     if (!product) {
         setMessage('Продукт не найден.');
@@ -100,7 +1260,7 @@ function updateCartItemQuantity(productId, change) {
     }
 
     const newQuantity = (currentItem.quantity || 0) + change;
-    const newCartItems = { ...appState.cartItems };
+    const newCartItems = { ...state.items.cartItems };
 
     if (newQuantity <= 0) {
         delete newCartItems[productId];
@@ -120,7 +1280,7 @@ function addToCart(productId) {
 }
 
 function removeFromCart(productId) {
-    const item = appState.cartItems[productId];
+    const item = state.items.cartItems[productId];
     if (item) {
         updateCartItemQuantity(productId, -item.quantity);
     }
@@ -139,7 +1299,7 @@ async function handleAddProduct(productData) {
         createdAt: new Date().toISOString(),
     };
     
-    const newProducts = [...appState.products, newProduct];
+    const newProducts = [...state.items.products, newProduct];
     setState({ products: newProducts }, () => {
         setMessage(`Продукт "${newProduct.name}" успешно добавлен.`);
     });
@@ -283,7 +1443,7 @@ function handleBulkImport(jsonString) {
         }
         
         let importCount = 0;
-        const newProducts = [...appState.products];
+        const newProducts = [...state.items.products];
 
         productsToImport.forEach(product => {
             if (typeof product === 'object' && product !== null && product.name && product.price > 0 && product.unit) {
@@ -372,17 +1532,17 @@ function renderHeader() {
                     Строй<span class="text-yellow-400">Маркет</span>
                 </h1>
                 <nav class="flex items-center space-x-4">
-                    <button 
-                        onclick="setView('home')" 
-                        class="text-lg font-medium transition duration-150 p-2 rounded-lg ${appState.view === 'home' || appState.view === 'details' ? 'text-yellow-400 bg-blue-700/50' : 'text-white hover:text-yellow-200 hover:bg-blue-700/50'}"
+                    <button
+                        onclick="setView('home')"
+                        class="text-lg font-medium transition duration-150 p-2 rounded-lg ${state.layout.view === 'home' || state.layout.view === 'details' ? 'text-yellow-400 bg-blue-700/50' : 'text-white hover:text-yellow-200 hover:bg-blue-700/50'}"
                     >
-                        Каталог
+                        <span class="js-editable">Каталог</span>
                     </button>
-                    <button 
-                        onclick="setView('admin')" 
-                        class="text-lg font-medium transition duration-150 p-2 rounded-lg ${appState.view === 'admin' ? 'text-yellow-400 bg-blue-700/50' : 'text-white hover:text-yellow-200 hover:bg-blue-700/50'} hidden sm:block"
+                    <button
+                        onclick="setView('admin')"
+                        class="text-lg font-medium transition duration-150 p-2 rounded-lg ${state.layout.view === 'admin' ? 'text-yellow-400 bg-blue-700/50' : 'text-white hover:text-yellow-200 hover:bg-blue-700/50'} hidden sm:block"
                     >
-                        Админ
+                        <span class="js-editable">Админ</span>
                     </button>
                     <button 
                         onclick="setView('cart')" 
@@ -404,15 +1564,28 @@ function renderHeader() {
     `;
 }
 
-function renderProductCard(product) {
-    const itemInCart = appState.cartItems[product.id];
+function buildEditorInputId(prefix, value) {
+    return `${prefix}-${String(value)}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+function resolveProductImage(product, { fallbackWidth = 400, fallbackHeight = 160 } = {}) {
+    const fallback = `https://placehold.co/${fallbackWidth}x${fallbackHeight}/2563eb/ffffff?text=${(product?.name || '').substring(0, 10)}`;
+    const override = state.items?.[product.id]?.img;
+    const baseImage = product?.image || fallback;
+    return override || baseImage || fallback;
+}
+
+function renderProductCard(product, index = 0) {
+    const itemInCart = state.items.cartItems[product.id];
     const priceHtml = formatCurrency(product.price);
+    const productImage = resolveProductImage(product);
+    const inputId = buildEditorInputId('replace-photo-card', `${product.id}-${index}`);
 
     return `
         <div class="bg-white rounded-xl shadow-xl overflow-hidden transform hover:scale-[1.02] transition duration-300 flex flex-col cursor-pointer" onclick="showDetails('${product.id}')">
             <div class="h-40 bg-gray-200 flex items-center justify-center overflow-hidden">
                 <img
-                    src="${product.image || 'https://placehold.co/400x160/2563eb/ffffff?text=' + product.name.substring(0, 10)}"
+                    src="${productImage}"
                     alt="${product.name}"
                     class="h-full w-full object-cover"
                     onerror="this.onerror=null; this.src='https://placehold.co/400x160/2563eb/ffffff?text=${product.name.substring(0, 10)}';"
@@ -428,7 +1601,7 @@ function renderProductCard(product) {
                         ${priceHtml} <span class="text-sm font-normal text-gray-500">/ ${product.unit}</span>
                     </p>
                     ${!itemInCart ? `
-                        <button 
+                        <button
                             onclick="event.stopPropagation(); addToCart('${product.id}')"
                             class="mt-3 w-full bg-green-500 text-white py-2 rounded-lg font-semibold hover:bg-green-600 transition duration-150 shadow-md"
                         >
@@ -451,6 +1624,22 @@ function renderProductCard(product) {
                             </button>
                         </div>
                     `}
+                    <div class="editor-only mt-4 space-y-2" onclick="event.stopPropagation()">
+                        <label for="${inputId}" class="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-3 py-2 text-sm font-semibold text-white shadow transition hover:bg-slate-800">
+                            <i class="fas fa-camera-retro text-xs"></i>
+                            <span>Заменить фото</span>
+                        </label>
+                        <input
+                            id="${inputId}"
+                            type="file"
+                            accept="image/*"
+                            class="hidden"
+                            onchange="handleProductImageReplace(event, ${JSON.stringify(product.id)})"
+                        />
+                        <p class="text-xs leading-snug text-amber-600">
+                            Изображение сохраняется в состоянии как dataURL и может значительно увеличить размер сохранения.
+                        </p>
+                    </div>
                 </div>
             </div>
         </div>
@@ -458,11 +1647,11 @@ function renderProductCard(product) {
 }
 
 function renderProductList() {
-    const productCards = appState.products.map(renderProductCard).join('');
+    const productCards = state.items.products.map((product, index) => renderProductCard(product, index)).join('');
     
     return `
         <div class="grid-container">
-            ${appState.products.length === 0 ? `
+            ${state.items.products.length === 0 ? `
                 <p class="col-span-full text-center text-gray-500 py-10">
                     Каталог пуст. Перейдите в "Админ" для добавления продуктов.
                 </p>
@@ -472,15 +1661,17 @@ function renderProductList() {
 }
 
 function renderProductDetails() {
-    const product = appState.products.find(p => p.id === appState.selectedProductId);
-    
+    const product = state.items.products.find(p => p.id === state.layout.selectedProductId);
+
     if (!product) {
         return `<div class="p-10 text-center text-red-600">Продукт не найден.</div>`;
     }
 
-    const itemInCart = appState.cartItems[product.id];
+    const itemInCart = state.items.cartItems[product.id];
     const priceHtml = formatCurrency(product.price);
     const descriptionHtml = product.description.replace(/\n/g, '<br>');
+    const productImage = resolveProductImage(product, { fallbackWidth: 800, fallbackHeight: 600 });
+    const detailInputId = buildEditorInputId('replace-photo-detail', product.id);
 
     return `
         <div class="max-w-5xl mx-auto p-6 bg-white rounded-xl shadow-2xl">
@@ -491,15 +1682,33 @@ function renderProductDetails() {
 
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
                 <!-- Image Area -->
-                <div class="relative bg-gray-100 rounded-lg overflow-hidden h-96">
-                    <img
-                        src="${product.image || 'https://placehold.co/800x600/2563eb/ffffff?text=' + product.name}"
-                        alt="${product.name}"
-                        class="w-full h-full object-cover"
-                        onerror="this.onerror=null; this.src='https://placehold.co/800x600/2563eb/ffffff?text=${product.name}';"
-                    />
+                <div class="flex flex-col gap-4">
+                    <div class="relative bg-gray-100 rounded-lg overflow-hidden h-96">
+                        <img
+                            src="${productImage}"
+                            alt="${product.name}"
+                            class="w-full h-full object-cover"
+                            onerror="this.onerror=null; this.src='https://placehold.co/800x600/2563eb/ffffff?text=${product.name}';"
+                        />
+                    </div>
+                    <div class="editor-only space-y-2" onclick="event.stopPropagation()">
+                        <label for="${detailInputId}" class="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-3 py-2 text-sm font-semibold text-white shadow transition hover:bg-slate-800">
+                            <i class="fas fa-camera-retro text-xs"></i>
+                            <span>Заменить фото</span>
+                        </label>
+                        <input
+                            id="${detailInputId}"
+                            type="file"
+                            accept="image/*"
+                            class="hidden"
+                            onchange="handleProductImageReplace(event, ${JSON.stringify(product.id)})"
+                        />
+                        <p class="text-xs leading-snug text-amber-600">
+                            Изображение сохраняется в состоянии как dataURL и может значительно увеличить размер сохранения.
+                        </p>
+                    </div>
                 </div>
-                
+
                 <!-- Details Area -->
                 <div>
                     <h2 class="text-4xl font-extrabold text-gray-900 mb-3">${product.name}</h2>
@@ -552,7 +1761,7 @@ function renderProductDetails() {
 function renderCartView() {
     const totalCost = calculateTotalCost();
 
-    const cartItemsHtml = Object.entries(appState.cartItems).map(([productId, item]) => `
+    const cartItemsHtml = Object.entries(state.items.cartItems).map(([productId, item]) => `
         <div class="flex items-center bg-white p-4 rounded-xl shadow-lg border-l-4 border-blue-500">
             <div class="flex-grow">
                 <h3 class="text-xl font-semibold text-gray-800">${item.name}</h3>
@@ -781,7 +1990,12 @@ function renderAdminPanel() {
             ${singleFormHtml}
         </div>
     `;
-    
+
+    if (window.editorMode) {
+        window.editorMode.refresh();
+        refreshCatalogSortables();
+    }
+
     const form = document.getElementById('singleProductForm');
     if (form) {
         form.onsubmit = function(e) {
@@ -808,12 +2022,12 @@ function renderAdminPanel() {
 }
 
 function renderMessageModal() {
-    if (!appState.message) return '';
+    if (!state.meta.message) return '';
     
     return `
         <div id="message-modal" class="modal fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center z-50 p-4">
             <div class="bg-white rounded-xl shadow-2xl p-6 max-w-sm w-full transform transition-all">
-                <p class="text-gray-800 font-medium mb-4">${appState.message}</p>
+                <p class="text-gray-800 font-medium mb-4">${state.meta.message}</p>
                 <button
                     onclick="setState({ message: '' })"
                     class="w-full bg-blue-600 text-white py-2 rounded-lg hover:bg-blue-700 transition duration-150"
@@ -831,7 +2045,7 @@ function render() {
     const appContainer = document.getElementById('app');
     let contentHtml = '';
 
-    switch (appState.view) {
+    switch (state.layout.view) {
         case 'cart':
             contentHtml = renderCartView();
             break;
@@ -853,14 +2067,21 @@ function render() {
         </main>
         ${renderMessageModal()}
     `;
-    
-    if (appState.view === 'admin') {
+
+    syncEditableContent({ captureMissing: true });
+
+    if (state.layout.view === 'admin') {
         renderAdminContent();
+    }
+
+    if (window.editorMode) {
+        window.editorMode.refresh();
+        refreshCatalogSortables();
     }
 }
 
 function renderAdminContent() {
-     if (appState.view === 'admin') {
+     if (state.layout.view === 'admin') {
         setTimeout(renderAdminPanel, 0);
      }
 }
@@ -877,10 +2098,23 @@ window.handleBulkImport = handleBulkImport;
 window.handleAddProduct = handleAddProduct;
 window.handleFileChange = handleFileChange;
 window.renderAdminContent = renderAdminContent;
+window.handleProductImageReplace = handleProductImageReplace;
 window.generateDescription = generateDescription; // Сделаем генерацию глобальной для тестов
+if (!window.undoStateChange) window.undoStateChange = undoStateChange;
+if (!window.redoStateChange) window.redoStateChange = redoStateChange;
 
 // Инициализация при загрузке страницы
-window.onload = function() {
-    loadState();
-    render();
-}
+window.addEventListener('load', () => {
+    initializeState()
+        .catch((error) => {
+            console.error('[RENDER:INIT]', error);
+        })
+        .finally(() => {
+            render();
+            if (window.editorMode) {
+                window.editorMode.setup();
+                window.editorMode.refresh();
+                refreshCatalogSortables();
+            }
+        });
+});
