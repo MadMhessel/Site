@@ -1,6 +1,5 @@
 // --- КОНФИГУРАЦИЯ ---
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=';
-const GEMINI_API_KEY = ""; // Вставьте ваш API-ключ Gemini
+const GEMINI_PROXY_ENDPOINT = '/api/generate';
 const LOGO_URL = 'https://i.imgur.com/RXyoozd.png';
 const PLACEHOLDER_IMAGE = 'https://placehold.co/600x400/e2e8f0/475569?text=No+Image';
 const FALLBACK_PRODUCTS = [
@@ -2041,6 +2040,7 @@ if (typeof window !== 'undefined') {
     window.saveStateSnapshot = saveStateSnapshot;
     window.ensureLocalforage = ensureLocalforage;
     window.isStateDirty = isStateDirty;
+    window.generateDescription = generateDescription;
 }
 
 // Внутреннее состояние формы администратора
@@ -2610,7 +2610,48 @@ function requestPrice(productId) {
     setMessage(`Запрос по товару "${product.name}" отправлен. Менеджер свяжется с вами.`);
 }
 
-// --- Функции Админа (без изменений) ---
+// --- Функции Админа ---
+async function generateDescription(productName) {
+    const normalizedName = typeof productName === 'string' ? productName.trim() : '';
+    if (!normalizedName) {
+        return 'Введите название продукта для генерации описания.';
+    }
+
+    try {
+        const response = await fetch(GEMINI_PROXY_ENDPOINT, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ productName: normalizedName }),
+        });
+
+        if (!response.ok) {
+            let errorMessage = `API failed: ${response.status} ${response.statusText}`;
+            try {
+                const errorBody = await response.json();
+                console.error('[GEMINI_ERROR]', errorBody);
+                if (errorBody?.error?.message) {
+                    errorMessage = errorBody.error.message;
+                }
+            } catch (parseError) {
+                console.error('[GEMINI_ERROR_PARSE]', parseError);
+            }
+            throw new Error(errorMessage);
+        }
+
+        const payload = await response.json();
+        const description = typeof payload?.description === 'string'
+            ? payload.description.trim()
+            : '';
+        return description || 'Не удалось сгенерировать описание.';
+    } catch (error) {
+        console.error('[GEMINI_PROXY_REQUEST_ERROR]', error);
+        if (error.name === 'TypeError') {
+            return 'Проблема с сетью. Проверьте подключение к интернету.';
+        }
+        return `Ошибка: ${error.message}`;
+    }
+}
+
 async function handleAddProduct(productData) {
     const rawProduct = {
         id: productData.id || `prod-${Date.now()}`,
@@ -3816,34 +3857,148 @@ function renderProductDetails() {
 function renderAdminPanel() {
     const adminContentElement = document.getElementById('admin-content');
     if (!adminContentElement) return;
+
+    const {
+        productName,
+        productPrice,
+        productUnit,
+        productImage,
+        productDescription,
+        jsonInput,
+        isGenerating,
+    } = window.adminState;
+
+    const sanitizedName = escapeHtmlAttribute(productName);
+    const sanitizedPrice = escapeHtmlAttribute(productPrice);
+    const sanitizedUnit = escapeHtmlAttribute(productUnit);
+    const sanitizedImage = escapeHtmlAttribute(productImage);
+    const sanitizedDescription = escapeHtml(productDescription);
+    const sanitizedJson = escapeHtml(jsonInput);
+    const generateButtonLabel = isGenerating ? 'Генерация…' : 'Сгенерировать описание';
+    const generateButtonDisabled = isGenerating || !String(productName || '').trim();
+
     adminContentElement.innerHTML = `
         <div class="max-w-3xl mx-auto p-6 space-y-8">
             <h2 class="text-3xl font-bold text-gray-800">Панель Администратора</h2>
             <div class="bg-white p-6 rounded-lg shadow-md space-y-4">
                  <h3 class="text-xl font-semibold text-gray-700">Массовый Импорт (JSON / CSV)</h3>
-                 <input type="file" id="json-file-upload" accept=".json, .csv" onchange="handleFileChange(this.files[0])" class="w-full border p-2 rounded"/>
-                 <textarea id="jsonInput" oninput="window.adminState.jsonInput = this.value;" rows="6" placeholder="Вставьте JSON или загрузите файл..." class="w-full border p-2 rounded">${window.adminState.jsonInput}</textarea>
-                 <button onclick="handleBulkImport(window.adminState.jsonInput)" class="w-full bg-indigo-600 text-white py-2 rounded-lg hover:bg-indigo-700">Импортировать</button>
+                 <input type="file" id="json-file-upload" accept=".json, .csv" class="w-full border p-2 rounded"/>
+                 <textarea id="jsonInput" rows="6" placeholder="Вставьте JSON или загрузите файл..." class="w-full border p-2 rounded">${sanitizedJson}</textarea>
+                 <button id="import-json" class="w-full bg-indigo-600 text-white py-2 rounded-lg hover:bg-indigo-700">Импортировать</button>
             </div>
              <form id="singleProductForm" class="bg-white p-6 rounded-lg shadow-md space-y-4">
                  <h3 class="text-xl font-semibold text-gray-700">Добавить продукт</h3>
-                 <input type="text" id="name" value="${window.adminState.productName}" oninput="window.adminState.productName = this.value;" placeholder="Название" class="w-full border p-2 rounded" required/>
+                 <input type="text" id="name" value="${sanitizedName}" placeholder="Название" class="w-full border p-2 rounded" required/>
                  <div class="flex gap-4">
-                    <input type="number" id="price" value="${window.adminState.productPrice}" oninput="window.adminState.productPrice = this.value;" placeholder="Цена" class="w-1/2 border p-2 rounded" required/>
-                    <input type="text" id="unit" value="${window.adminState.productUnit}" oninput="window.adminState.productUnit = this.value;" placeholder="Ед. изм." class="w-1/2 border p-2 rounded"/>
+                    <input type="number" id="price" value="${sanitizedPrice}" placeholder="Цена" class="w-1/2 border p-2 rounded" required min="0.01" step="0.01"/>
+                    <input type="text" id="unit" value="${sanitizedUnit}" placeholder="Ед. изм." class="w-1/2 border p-2 rounded"/>
                  </div>
-                 <input type="text" id="image" value="${window.adminState.productImage}" oninput="window.adminState.productImage = this.value;" placeholder="URL изображения" class="w-full border p-2 rounded"/>
-                 <textarea id="description" oninput="window.adminState.productDescription = this.value;" rows="4" placeholder="Описание" class="w-full border p-2 rounded" required>${window.adminState.productDescription}</textarea>
+                 <input type="text" id="image" value="${sanitizedImage}" placeholder="URL изображения" class="w-full border p-2 rounded"/>
+                 <div class="space-y-3">
+                     <div class="flex items-center justify-between">
+                         <label for="description" class="text-sm font-medium text-gray-700">Описание</label>
+                         <button type="button" id="generate-description" class="text-sm font-semibold text-indigo-600 hover:text-indigo-500 disabled:opacity-60" ${generateButtonDisabled ? 'disabled' : ''}>${generateButtonLabel}</button>
+                     </div>
+                     <textarea id="description" rows="4" placeholder="Описание" class="w-full border p-2 rounded" required>${sanitizedDescription}</textarea>
+                 </div>
                  <button type="submit" class="w-full bg-gray-800 hover:bg-gray-700 text-white py-2 rounded-lg">Добавить товар</button>
              </form>
         </div>`;
-    
-    document.getElementById('singleProductForm').onsubmit = (e) => {
-        e.preventDefault();
-        handleAddProduct({ name: window.adminState.productName, price: window.adminState.productPrice, unit: window.adminState.productUnit, description: window.adminState.productDescription, image: window.adminState.productImage });
-        window.adminState = {...window.adminState, productName: '', productPrice: '', productUnit: 'шт', productDescription: '', productImage: 'https://placehold.co/400x300/e2e8f0/94a3b8?text=Стройматериал'};
-        renderAdminContent();
-    };
+
+    const fileInput = adminContentElement.querySelector('#json-file-upload');
+    if (fileInput) {
+        fileInput.addEventListener('change', (event) => {
+            const file = event?.target?.files?.[0];
+            if (file) handleFileChange(file);
+        });
+    }
+
+    const jsonTextarea = adminContentElement.querySelector('#jsonInput');
+    if (jsonTextarea) {
+        jsonTextarea.addEventListener('input', (event) => {
+            window.adminState.jsonInput = event.target.value;
+        });
+    }
+
+    const importButton = adminContentElement.querySelector('#import-json');
+    if (importButton) {
+        importButton.addEventListener('click', (event) => {
+            event.preventDefault();
+            handleBulkImport(window.adminState.jsonInput);
+        });
+    }
+
+    const form = adminContentElement.querySelector('#singleProductForm');
+    if (form) {
+        const nameInput = form.querySelector('#name');
+        const priceInput = form.querySelector('#price');
+        const unitInput = form.querySelector('#unit');
+        const imageInput = form.querySelector('#image');
+        const descriptionInput = form.querySelector('#description');
+        const generateButton = form.querySelector('#generate-description');
+
+        if (nameInput) {
+            nameInput.addEventListener('input', (event) => {
+                window.adminState.productName = event.target.value;
+            });
+        }
+        if (priceInput) {
+            priceInput.addEventListener('input', (event) => {
+                window.adminState.productPrice = event.target.value;
+            });
+        }
+        if (unitInput) {
+            unitInput.addEventListener('input', (event) => {
+                window.adminState.productUnit = event.target.value;
+            });
+        }
+        if (imageInput) {
+            imageInput.addEventListener('input', (event) => {
+                window.adminState.productImage = event.target.value;
+            });
+        }
+        if (descriptionInput) {
+            descriptionInput.addEventListener('input', (event) => {
+                window.adminState.productDescription = event.target.value;
+            });
+        }
+        if (generateButton) {
+            generateButton.addEventListener('click', async () => {
+                if (window.adminState.isGenerating || !window.adminState.productName.trim()) {
+                    return;
+                }
+                window.adminState.isGenerating = true;
+                renderAdminContent();
+                try {
+                    const desc = await generateDescription(window.adminState.productName);
+                    window.adminState.productDescription = desc;
+                } finally {
+                    window.adminState.isGenerating = false;
+                    renderAdminContent();
+                }
+            });
+        }
+
+        form.addEventListener('submit', (event) => {
+            event.preventDefault();
+            handleAddProduct({
+                name: window.adminState.productName,
+                price: window.adminState.productPrice,
+                unit: window.adminState.productUnit,
+                description: window.adminState.productDescription,
+                image: window.adminState.productImage,
+            });
+            window.adminState = {
+                ...window.adminState,
+                productName: '',
+                productPrice: '',
+                productUnit: 'шт',
+                productDescription: '',
+                productImage: 'https://placehold.co/400x300/e2e8f0/94a3b8?text=Стройматериал',
+            };
+            renderAdminContent();
+        });
+    }
 }
 
 function renderAdminContent() {
