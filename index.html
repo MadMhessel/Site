@@ -1,245 +1,72 @@
 <!DOCTYPE html>
 <html lang="ru">
-<head>
-    <!-- latch-edit-flag: фикс потерянного edit при раннем переписывании URL/DOM -->
-    <script>
-        (function () {
-            "use strict";
-            // Истина: edit без значения, или =1/true/on/yes
-            function truthy(v) {
-                if (v == null) return false;
-                v = String(v).trim().toLowerCase();
-                return v === "" || v === "1" || v === "true" || v === "on" || v === "yes";
-            }
-
-            // 1) Ищем edit в location.search
-            var sp = new URLSearchParams(location.search);
-            if (sp.has("edit") && truthy(sp.get("edit"))) {
-                sessionStorage.setItem("editModeRequested", "1");
-                return;
-            }
-
-            // 2) Ищем edit в hash-параметрах, напр. "#/route?edit=1"
-            var h = location.hash || "";
-            var qIndex = h.indexOf("?");
-            if (qIndex !== -1) {
-                var hp = new URLSearchParams(h.slice(qIndex + 1));
-                if (hp.has("edit") && truthy(hp.get("edit"))) {
-                    sessionStorage.setItem("editModeRequested", "1");
-                    return;
-                }
-            }
-        })();
-    </script>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>СтройМаркет - Автономный Каталог</title>
-    <!-- Подключение Tailwind CSS CDN -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Font Awesome -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css">
-    <!-- SortableJS -->
-    <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
-    <style>
-        /* Настройка шрифта и скроллинга */
-        body {
-            font-family: 'Inter', sans-serif;
-            min-height: 100vh;
-            background-color: #f3f4f6;
-        }
-        /* Адаптивное центрирование для карточек */
-        .grid-container {
-            display: grid;
-            gap: 24px;
-            padding: 24px;
-            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-        }
-        /* Стили для типографики на статических страницах */
-        .prose {
-            color: #374151;
-        }
-        .prose h2 {
-            font-size: 1.875rem;
-            font-weight: 700;
-            margin-bottom: 1.5rem;
-            border-bottom: 1px solid #e5e7eb;
-            padding-bottom: 0.5rem;
-        }
-        .prose h3 {
-             font-size: 1.5rem;
-             font-weight: 700;
-             margin-bottom: 1rem;
-        }
-        .prose p, .prose ul, .prose ol {
-            line-height: 1.75;
-            margin-bottom: 1.25rem;
-        }
-         /* Анимация для всплывающих сообщений */
-        @keyframes fade-in-down {
-            from {
-                opacity: 0;
-                transform: translateY(-20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-        .animate-fade-in-down {
-            animation: fade-in-down 0.5s ease-out forwards;
-        }
-        body:not(.editor-mode) .editor-only,
-        body:not(.editor-mode) .js-drag {
-            display: none !important;
-        }
-
-        body.editor-mode .js-drag {
-            cursor: grab;
-        }
-
-        body.editor-mode .js-drag:active {
-            cursor: grabbing;
-        }
-
-        #editor-panel {
-            display: none;
-        }
-
-        #editor-panel button:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-
-        body.editor-mode #editor-panel {
-            display: flex;
-        }
-
-        body.editor-mode .js-editable,
-        body.editor-mode [data-editable] {
-            outline: 1px dashed rgba(37, 99, 235, 0.35);
-            outline-offset: 2px;
-            cursor: text;
-            transition: background-color 0.2s ease-in-out;
-        }
-
-        body.editor-mode .js-editable:hover,
-        body.editor-mode [data-editable]:hover {
-            background-color: rgba(37, 99, 235, 0.04);
-        }
-
-        body.editor-mode .js-editable:focus-visible,
-        body.editor-mode [data-editable]:focus-visible {
-            outline: 2px solid #2563eb;
-            outline-offset: 2px;
-        }
-
-        body.editor-mode [data-group-id] {
-            outline: 1px dashed rgba(107, 114, 128, 0.35);
-            outline-offset: 4px;
-        }
-
-        body.editor-mode [data-item-id] {
-            outline: 1px dashed rgba(148, 163, 184, 0.4);
-            outline-offset: 2px;
-        }
-
-        #editor-toggle:focus-visible,
-        #editor-panel button:focus-visible {
-            outline: 3px solid rgba(37, 99, 235, 0.6);
-            outline-offset: 2px;
-        }
-
-        body:not(.editor-mode) .js-editable:focus,
-        body:not(.editor-mode) [data-editable]:focus {
-            outline: none;
-        }
-    </style>
-</head>
-<body>
-
-    <button
-        id="editor-toggle"
-        type="button"
-        class="fixed top-4 right-4 z-50 inline-flex min-h-[44px] min-w-[44px] items-center justify-center gap-2 rounded-md bg-gray-900 px-4 py-2 text-white shadow-lg"
-        aria-controls="editor-panel"
-        aria-label="Переключить режим редактирования"
-        aria-pressed="false"
-        aria-hidden="true"
-        hidden
-    >
-        Редактировать
-    </button>
-
-    <div
-        id="editor-panel"
-        class="fixed top-20 right-4 z-40 flex w-56 flex-col gap-2 rounded-xl border border-gray-200 bg-white p-4 shadow-xl"
-        role="toolbar"
-        aria-hidden="true"
-        aria-label="Панель редактора"
-        style="display: none;"
-    >
-        <div class="flex items-center justify-between text-xs font-semibold text-gray-600">
-            <span>API статус</span>
-            <span class="flex items-center gap-2">
-                <span class="inline-flex h-2.5 w-2.5 rounded-full bg-gray-300" data-editor-health-indicator aria-hidden="true"></span>
-                <span class="text-[11px] font-medium text-gray-500" data-editor-health-text>Не проверено</span>
-            </span>
-        </div>
-        <div class="grid grid-cols-2 gap-2">
-            <button
-                type="button"
-                data-editor-action="undo"
-                class="rounded-lg bg-gray-200 px-3 py-2 text-sm font-semibold text-gray-700 transition hover:bg-gray-300"
-                aria-label="Отменить последнее изменение"
-                disabled
-            >
-                Отменить
-            </button>
-            <button
-                type="button"
-                data-editor-action="redo"
-                class="rounded-lg bg-gray-200 px-3 py-2 text-sm font-semibold text-gray-700 transition hover:bg-gray-300"
-                aria-label="Повторить отменённое изменение"
-                disabled
-            >
-                Повторить
-            </button>
-        </div>
-        <button
-            type="button"
-            data-editor-action="export"
-            class="w-full rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700"
-            aria-label="Экспортировать состояние сайта в JSON"
-        >
-            Экспорт JSON
-        </button>
-        <button
-            type="button"
-            data-editor-action="import"
-            class="w-full rounded-lg bg-amber-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-amber-600"
-            aria-label="Импортировать состояние сайта из JSON"
-        >
-            Импорт JSON
-        </button>
-        <input id="editor-import-input" type="file" accept="application/json" class="hidden" />
-        <p class="text-xs leading-snug text-gray-500">
-            Импорт заменит текущее состояние. Перед загрузкой сохраните резервную копию.
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="Каталог строительных материалов с интерактивным управлением и онлайн-редактированием"
+    />
+    <title>Каталог строительных материалов</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="site-header" role="banner">
+      <div class="site-header__content">
+        <h1 class="site-header__title js-editable" tabindex="0" aria-label="Заголовок сайта">
+          Каталог строительных материалов
+        </h1>
+        <p class="site-header__subtitle js-editable" tabindex="0" aria-label="Описание сайта">
+          Подбор и заказ строительных материалов с доставкой по всей России
         </p>
-    </div>
+        <nav class="site-nav" aria-label="Основная навигация">
+          <a href="#home" class="site-nav__link">Главная</a>
+          <a href="#catalog" class="site-nav__link">Каталог</a>
+          <a href="#cart" class="site-nav__link" aria-label="Перейти в корзину">
+            Корзина <span class="js-cart-count" aria-live="polite">0</span>
+          </a>
+        </nav>
+      </div>
+    </header>
 
-    <div id="app" class="min-h-screen">
-        <!-- Содержимое будет сгенерировано JS -->
-    </div>
+    <main id="app" class="app" tabindex="-1"></main>
 
-    <script defer src="editor.js"></script>
-    <!-- Подключаем файл с каталогом -->
-    <script src="catalog.js"></script>
-    <!-- Загрузка единого файла логики -->
-    <script src="app.js"></script>
-    <!-- Вспомогательный бутстрап редактора -->
-    <script defer src="editor-boot.js"></script>
-    <script defer src="editor-hardlock.js"></script>
+    <footer class="site-footer" role="contentinfo">
+      <p class="js-editable" tabindex="0" aria-label="Контактная информация">
+        © 2024 «СтройПрофКаталог». Все права защищены. Тел.: +7 (495) 000-00-00
+      </p>
+      <button class="button button--secondary js-toggle-edit" type="button" aria-pressed="false">
+        Режим редактирования
+      </button>
+    </footer>
 
-</body>
+    <dialog class="modal js-modal" aria-modal="true" aria-labelledby="modal-title">
+      <form method="dialog" class="modal__form">
+        <h2 id="modal-title" class="modal__title">Вход в режим редактирования</h2>
+        <label class="modal__label" for="pin-input">PIN-код</label>
+        <input id="pin-input" class="modal__input" type="password" autocomplete="one-time-code" />
+        <menu class="modal__actions">
+          <button value="cancel" class="button button--secondary">Отмена</button>
+          <button value="default" class="button">Войти</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <template id="product-card-template">
+      <article class="product-card" tabindex="0">
+        <img class="product-card__image" loading="lazy" alt="" />
+        <div class="product-card__body">
+          <h3 class="product-card__title js-editable" tabindex="0"></h3>
+          <p class="product-card__description js-editable" tabindex="0"></p>
+          <p class="product-card__price" aria-label="Цена товара"></p>
+          <div class="product-card__actions">
+            <button class="button button--icon js-generate" type="button">AI описание</button>
+            <button class="button js-add-to-cart" type="button">В корзину</button>
+          </div>
+        </div>
+      </article>
+    </template>
+
+    <script type="module" src="assets/main.js"></script>
+  </body>
 </html>
-
