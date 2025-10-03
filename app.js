@@ -796,6 +796,8 @@ const Editor = (() => {
     };
 
     const init = () => {
+        if (window.__APP_INIT_DONE__) return;
+        window.__APP_INIT_DONE__ = true;
         if (!documentAvailable || state.initialized) return;
         state.isEnabled = getEditFlag();
         state.button = document.querySelector(CONFIG.selectors.editorToggle);
@@ -3647,8 +3649,16 @@ function renderHeader() {
 
                     <!-- Search Bar -->
                     <div class="hidden lg:flex flex-grow max-w-lg mx-4">
-                        <input type="text" placeholder="Поиск" oninput="handleSearch(this.value)" value="${state.meta.searchTerm}" class="w-full border border-gray-300 px-4 py-2 focus:ring-2 focus:ring-[#fcc521] focus:outline-none"/>
-                        <button onclick="handleSearch(document.querySelector('input[placeholder=\\'Поиск\\']').value)" class="bg-[#fcc521] text-gray-800 font-bold px-4 hover:bg-yellow-500">
+                        <input
+                            id="site-search"
+                            class="w-full border border-gray-300 px-4 py-2 focus:ring-2 focus:ring-[#fcc521] focus:outline-none js-site-search"
+                            type="search"
+                            name="q"
+                            placeholder="Поиск"
+                            oninput="handleSearch(this.value)"
+                            value="${state.meta.searchTerm}"
+                        />
+                        <button onclick="handleSearch(document.getElementById('site-search')?.value || '')" class="bg-[#fcc521] text-gray-800 font-bold px-4 hover:bg-yellow-500">
                             <i class="fas fa-search"></i>
                         </button>
                     </div>
