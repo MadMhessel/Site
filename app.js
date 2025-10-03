@@ -11,7 +11,7 @@ const CONFIG = {
         editorImport: '[data-editor-action="import"]',
         editorHealthIndicator: '[data-editor-health-indicator]',
         editorHealthText: '[data-editor-health-text]',
-        editable: '.js-editable',
+        editable: '.js-editable, [data-editable]',
         dragHandle: '.js-drag',
         groupsContainer: '[data-groups-container="catalog"]',
     },
@@ -83,6 +83,18 @@ function isTruthyEditValue(rawValue) {
 function getEditFlag() {
     if (typeof window === 'undefined') {
         return false;
+    }
+
+    if (window.EditorSession && typeof window.EditorSession.isEditModeRequested === 'function') {
+        try {
+            const requested = window.EditorSession.isEditModeRequested();
+            if (typeof requested === 'boolean') {
+                return requested;
+            }
+            return Boolean(requested);
+        } catch (error) {
+            console.warn('[EDITOR:FLAG]', 'session-read', error);
+        }
     }
 
     try {
@@ -565,7 +577,7 @@ const Editor = (() => {
 
     const updateButtonState = () => {
         if (!state.button) return;
-        const label = state.isActive ? 'Завершить редактирование' : 'Редактировать';
+        const label = state.isActive ? 'Выключить редактирование' : 'Редактировать';
         state.button.textContent = label;
         state.button.setAttribute('aria-pressed', String(state.isActive));
         state.button.setAttribute('aria-label', state.isActive ? 'Выключить режим редактирования' : 'Включить режим редактирования');

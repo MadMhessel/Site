@@ -84,18 +84,21 @@
             display: flex;
         }
 
-        body.editor-mode .js-editable {
+        body.editor-mode .js-editable,
+        body.editor-mode [data-editable] {
             outline: 1px dashed rgba(37, 99, 235, 0.35);
             outline-offset: 2px;
             cursor: text;
             transition: background-color 0.2s ease-in-out;
         }
 
-        body.editor-mode .js-editable:hover {
+        body.editor-mode .js-editable:hover,
+        body.editor-mode [data-editable]:hover {
             background-color: rgba(37, 99, 235, 0.04);
         }
 
-        body.editor-mode .js-editable:focus-visible {
+        body.editor-mode .js-editable:focus-visible,
+        body.editor-mode [data-editable]:focus-visible {
             outline: 2px solid #2563eb;
             outline-offset: 2px;
         }
@@ -116,7 +119,8 @@
             outline-offset: 2px;
         }
 
-        body:not(.editor-mode) .js-editable:focus {
+        body:not(.editor-mode) .js-editable:focus,
+        body:not(.editor-mode) [data-editable]:focus {
             outline: none;
         }
     </style>
@@ -197,6 +201,7 @@
         <!-- Содержимое будет сгенерировано JS -->
     </div>
 
+    <script defer src="editor.js"></script>
     <!-- Подключаем файл с каталогом -->
     <script src="catalog.js"></script>
     <!-- Загрузка единого файла логики -->
