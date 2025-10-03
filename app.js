@@ -312,7 +312,11 @@ async function ensureEditorPin({ allowCreate = true } = {}) {
 
 if (!window.editorMode) {
     const searchParams = new URLSearchParams(window.location.search);
-    const isEnabled = searchParams.get(EDIT_QUERY_PARAM) === '1';
+    const rawFlag = searchParams.get(EDIT_QUERY_PARAM);
+    const isFlagPresent = searchParams.has(EDIT_QUERY_PARAM);
+    const normalizedFlag = typeof rawFlag === 'string' ? rawFlag.trim().toLowerCase() : null;
+    const falsyFlags = new Set(['0', 'false', 'no', 'off', 'disable', 'disabled']);
+    const isEnabled = isFlagPresent && !falsyFlags.has(normalizedFlag || '');
     const handlers = new WeakMap();
     const documentAvailable = typeof document !== 'undefined';
     const getBodyElement = () => (documentAvailable ? document.body : null);
