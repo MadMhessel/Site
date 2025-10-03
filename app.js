@@ -1,12 +1,19 @@
 // --- КОНФИГУРАЦИЯ ---
-const APP_ID = 'art-stroy-clone';
-const SCHEMA_VERSION = 1;
-const PRODUCTS_STORAGE_KEY = 'art-stroy-clone_products_v1';
-const CART_STORAGE_KEY = `${APP_ID}_cart`;
 const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=';
 const GEMINI_API_KEY = ""; // Вставьте ваш API-ключ Gemini
 const LOGO_URL = 'https://i.imgur.com/RXyoozd.png';
 const PLACEHOLDER_IMAGE = 'https://placehold.co/600x400/e2e8f0/475569?text=No+Image';
+const FALLBACK_PRODUCTS = [
+    {
+        id: 'demo-1',
+        name: 'Пеноблок D600 (600x200x300)',
+        price: 350,
+        unit: 'шт',
+        category: 'Демо-товары',
+        description: 'Легкий и прочный пеноблок.',
+        image: 'https://placehold.co/400x300/4a7a9c/ffffff?text=Пеноблок',
+    },
+];
 const VIEW_ROUTES = {
     home: '',
     catalog: 'catalog',
@@ -19,6 +26,542 @@ const VIEW_ROUTES = {
     about: 'about',
     contacts: 'contacts',
 };
+
+const EDIT_QUERY_PARAM = 'edit';
+
+const STATE_STORAGE_KEY = 'site_state_v1';
+const STATE_BACKUP_PREFIX = 'site_state_backup_';
+const MAX_STATE_BACKUPS = 3;
+const STATE_SAVE_DEBOUNCE = 500;
+const EDITOR_PIN_STORAGE_KEY = 'site_editor_pin_hash';
+const EDITOR_PIN_DIGEST_PREFIX = 'sha256:';
+
+var UNDO_STACK_LIMIT = typeof UNDO_STACK_LIMIT === 'number' ? UNDO_STACK_LIMIT : 50;
+var HISTORY_TRACKED_KEYS = (typeof HISTORY_TRACKED_KEYS !== 'undefined' && HISTORY_TRACKED_KEYS instanceof Set)
+    ? HISTORY_TRACKED_KEYS
+    : new Set();
+['products', 'cartItems', 'slides', 'groupsOrder', 'itemsOrderByGroup', 'checkoutState']
+    .forEach((key) => HISTORY_TRACKED_KEYS.add(key));
+
+var editorHistoryStore = (() => {
+    const scope = typeof window !== 'undefined' ? window : globalThis;
+    if (!scope.__editorHistory) {
+        scope.__editorHistory = {
+            undoStack: [],
+            redoStack: [],
+            activeTextEditKeys: new Set(),
+            isUndoRedoInProgress: false,
+        };
+    }
+    return scope.__editorHistory;
+})();
+
+const activeTextEditKeys = editorHistoryStore.activeTextEditKeys;
+
+const dirtyStateManager = (() => {
+    const scope = typeof window !== 'undefined' ? window : globalThis;
+    const existing = scope.__editorDirtyState;
+    if (existing && typeof existing.markDirty === 'function' && typeof existing.markSaved === 'function' && typeof existing.isDirty === 'function') {
+        if (typeof existing.attachBeforeUnload === 'function') {
+            existing.attachBeforeUnload();
+        }
+        if (typeof window !== 'undefined') {
+            window.isStateDirty = () => existing.isDirty();
+        }
+        return existing;
+    }
+
+    const manager = {
+        generation: 0,
+        lastSavedGeneration: 0,
+        dirty: false,
+        beforeUnloadAttached: false,
+        beforeUnloadHandler: null,
+        markDirty() {
+            manager.generation += 1;
+            manager.dirty = true;
+            manager.attachBeforeUnload();
+            return manager.generation;
+        },
+        markSaved(generation) {
+            if (typeof generation !== 'number') return;
+            if (generation > manager.lastSavedGeneration) {
+                manager.lastSavedGeneration = generation;
+            }
+            if (manager.lastSavedGeneration >= manager.generation && manager.dirty) {
+                manager.dirty = false;
+            }
+        },
+        isDirty() {
+            return manager.dirty;
+        },
+        attachBeforeUnload() {
+            if (manager.beforeUnloadAttached || typeof window === 'undefined') return;
+            const handler = (event) => {
+                if (!manager.dirty) {
+                    return undefined;
+                }
+                event.preventDefault();
+                event.returnValue = '';
+                return '';
+            };
+            window.addEventListener('beforeunload', handler);
+            manager.beforeUnloadAttached = true;
+            manager.beforeUnloadHandler = handler;
+        },
+    };
+
+    scope.__editorDirtyState = manager;
+    if (typeof window !== 'undefined') {
+        window.isStateDirty = () => manager.isDirty();
+    }
+    manager.attachBeforeUnload();
+    return manager;
+})();
+
+const markStateDirty = () => dirtyStateManager.markDirty();
+const markStateSaved = (generation) => dirtyStateManager.markSaved(generation);
+const isStateDirty = () => dirtyStateManager.isDirty();
+
+function updateEditorHistoryButtons() {
+    if (typeof document === 'undefined') return;
+    const editorState = window.editorMode?.state;
+    if (!editorState) return;
+    const canUndo = editorHistoryStore.undoStack.length > 0;
+    const canRedo = editorHistoryStore.redoStack.length > 0;
+    if (editorState.undoButton) {
+        editorState.undoButton.disabled = !canUndo;
+        editorState.undoButton.setAttribute('aria-disabled', String(!canUndo));
+    }
+    if (editorState.redoButton) {
+        editorState.redoButton.disabled = !canRedo;
+        editorState.redoButton.setAttribute('aria-disabled', String(!canRedo));
+    }
+}
+
+function prepareUndoSnapshot() {
+    if (editorHistoryStore.isUndoRedoInProgress) return null;
+    return cloneStateSnapshot();
+}
+
+function commitUndoSnapshot(snapshot) {
+    if (!snapshot) return;
+    editorHistoryStore.undoStack.push(snapshot);
+    if (editorHistoryStore.undoStack.length > UNDO_STACK_LIMIT) {
+        editorHistoryStore.undoStack.splice(0, editorHistoryStore.undoStack.length - UNDO_STACK_LIMIT);
+    }
+    editorHistoryStore.redoStack.length = 0;
+    updateEditorHistoryButtons();
+}
+
+function pushRedoSnapshot(snapshot) {
+    if (!snapshot) return;
+    editorHistoryStore.redoStack.push(snapshot);
+    if (editorHistoryStore.redoStack.length > UNDO_STACK_LIMIT) {
+        editorHistoryStore.redoStack.splice(0, editorHistoryStore.redoStack.length - UNDO_STACK_LIMIT);
+    }
+    updateEditorHistoryButtons();
+}
+
+async function applyHistorySnapshot(snapshot) {
+    if (!snapshot) return;
+    editorHistoryStore.isUndoRedoInProgress = true;
+    activeTextEditKeys.clear();
+    try {
+        state = JSON.parse(JSON.stringify(snapshot));
+        if (typeof window !== 'undefined') {
+            window.state = state;
+        }
+        ensureLayoutOrdering();
+        destroyCatalogSortables();
+        stopSlider();
+        render();
+        if (state.layout.view === 'home') {
+            startSlider();
+        }
+        if (window.editorMode) {
+            window.editorMode.refresh();
+            refreshCatalogSortables();
+        }
+        await saveStateSnapshot(true);
+    } finally {
+        editorHistoryStore.isUndoRedoInProgress = false;
+        updateEditorHistoryButtons();
+    }
+}
+
+async function undoStateChange() {
+    if (!editorHistoryStore.undoStack.length) return;
+    const previousSnapshot = editorHistoryStore.undoStack.pop();
+    const currentSnapshot = prepareUndoSnapshot();
+    if (currentSnapshot) {
+        pushRedoSnapshot(currentSnapshot);
+    }
+    await applyHistorySnapshot(previousSnapshot);
+}
+
+async function redoStateChange() {
+    if (!editorHistoryStore.redoStack.length) return;
+    const nextSnapshot = editorHistoryStore.redoStack.pop();
+    const currentSnapshot = prepareUndoSnapshot();
+    if (currentSnapshot) {
+        editorHistoryStore.undoStack.push(currentSnapshot);
+        if (editorHistoryStore.undoStack.length > UNDO_STACK_LIMIT) {
+            editorHistoryStore.undoStack.splice(0, editorHistoryStore.undoStack.length - UNDO_STACK_LIMIT);
+        }
+    }
+    await applyHistorySnapshot(nextSnapshot);
+}
+
+function getSafeLocalStorage() {
+    if (typeof window === 'undefined') {
+        return null;
+    }
+    try {
+        return window.localStorage;
+    } catch (error) {
+        console.warn('LocalStorage is not available for editor PIN protection.', error);
+        return null;
+    }
+}
+
+function normalizeEditorPinHash(value) {
+    if (typeof value !== 'string') {
+        return '';
+    }
+    return value.startsWith(EDITOR_PIN_DIGEST_PREFIX)
+        ? value.slice(EDITOR_PIN_DIGEST_PREFIX.length)
+        : value;
+}
+
+async function hashEditorPin(pin) {
+    const normalized = typeof pin === 'string' ? pin.trim() : '';
+    if (!normalized) {
+        return null;
+    }
+    if (typeof window !== 'undefined' && window.crypto?.subtle && typeof TextEncoder !== 'undefined') {
+        const encoder = new TextEncoder();
+        const data = encoder.encode(normalized);
+        const digest = await window.crypto.subtle.digest('SHA-256', data);
+        const hashArray = Array.from(new Uint8Array(digest));
+        const hex = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+        return `${EDITOR_PIN_DIGEST_PREFIX}${hex}`;
+    }
+
+    let hash = 0;
+    for (let index = 0; index < normalized.length; index += 1) {
+        hash = ((hash << 5) - hash) + normalized.charCodeAt(index);
+        hash |= 0; // eslint-disable-line no-bitwise
+    }
+    const fallbackHex = Math.abs(hash).toString(16);
+    return `${EDITOR_PIN_DIGEST_PREFIX}${fallbackHex}`;
+}
+
+async function ensureEditorPin({ allowCreate = true } = {}) {
+    if (typeof window === 'undefined') {
+        return false;
+    }
+
+    const storage = getSafeLocalStorage();
+    if (!storage) {
+        return window.confirm('Локальное хранилище недоступно. Продолжить без проверки PIN?');
+    }
+
+    const storedHash = storage.getItem(EDITOR_PIN_STORAGE_KEY);
+    if (!storedHash) {
+        if (!allowCreate) {
+            return false;
+        }
+        const shouldCreate = window.confirm('Для работы редактора необходимо создать локальный PIN. Продолжить?');
+        if (!shouldCreate) {
+            return false;
+        }
+        const firstPin = window.prompt('Введите новый PIN (минимум 4 символа):');
+        if (!firstPin || firstPin.trim().length < 4) {
+            window.alert('PIN должен содержать минимум 4 символа.');
+            return false;
+        }
+        const confirmation = window.prompt('Повторите PIN для подтверждения:');
+        if (confirmation !== firstPin) {
+            window.alert('PIN не совпадает.');
+            return false;
+        }
+        const hashed = await hashEditorPin(firstPin);
+        if (!hashed) {
+            window.alert('Не удалось сохранить PIN. Попробуйте снова.');
+            return false;
+        }
+        storage.setItem(EDITOR_PIN_STORAGE_KEY, hashed);
+        return true;
+    }
+
+    const pin = window.prompt('Введите PIN редактора:');
+    if (pin === null) {
+        return false;
+    }
+    const hashed = await hashEditorPin(pin);
+    if (!hashed) {
+        window.alert('PIN не может быть пустым.');
+        return false;
+    }
+    if (normalizeEditorPinHash(hashed) === normalizeEditorPinHash(storedHash)) {
+        return true;
+    }
+    window.alert('Неверный PIN.');
+    return false;
+}
+
+if (!window.editorMode) {
+    const searchParams = new URLSearchParams(window.location.search);
+    const isEnabled = searchParams.get(EDIT_QUERY_PARAM) === '1';
+    const handlers = new WeakMap();
+    const documentAvailable = typeof document !== 'undefined';
+    const getBodyElement = () => (documentAvailable ? document.body : null);
+    const state = {
+        isEnabled,
+        isActive: false,
+        isAuthorized: false,
+        authorizationPromise: null,
+        button: null,
+        initialized: false,
+        handlers,
+        panel: null,
+        panelInitialized: false,
+        exportButton: null,
+        importButton: null,
+        importInput: null,
+        undoButton: null,
+        redoButton: null,
+    };
+
+    const initialBody = getBodyElement();
+    if (initialBody) {
+        initialBody.classList.toggle('editor-mode', state.isActive);
+    }
+
+    const emitEditorChanged = (element, trigger) => {
+        const text = element.textContent ?? '';
+        element.textContent = text;
+        if (typeof computeEditorKey === 'function') {
+            computeEditorKey(element);
+        }
+        const event = new CustomEvent('editor:changed', {
+            bubbles: true,
+            detail: { text, trigger },
+        });
+        element.dispatchEvent(event);
+    };
+
+    const detachHandler = (element) => {
+        const handler = state.handlers.get(element);
+        if (!handler) return;
+        element.removeEventListener('input', handler);
+        element.removeEventListener('blur', handler);
+        state.handlers.delete(element);
+    };
+
+    const createHandler = (element) => (event) => {
+        emitEditorChanged(element, event.type);
+    };
+
+    const updatePanelVisibility = () => {
+        if (!state.panel) return;
+        const shouldShow = state.isEnabled && state.isActive;
+        state.panel.style.display = shouldShow ? 'flex' : 'none';
+        state.panel.setAttribute('aria-hidden', shouldShow ? 'false' : 'true');
+    };
+
+    const initializeEditorPanel = () => {
+        if (!documentAvailable || state.panelInitialized) return;
+        const panel = document.getElementById('editor-panel');
+        if (!panel) return;
+
+        const undoButton = panel.querySelector('[data-editor-action="undo"]');
+        const redoButton = panel.querySelector('[data-editor-action="redo"]');
+        const exportButton = panel.querySelector('[data-editor-action="export"]');
+        const importButton = panel.querySelector('[data-editor-action="import"]');
+        const importInput = document.getElementById('editor-import-input')
+            || panel.querySelector('input[type="file"]');
+
+        if (undoButton) {
+            undoButton.addEventListener('click', () => {
+                if (!state.isEnabled || !state.isActive) return;
+                undoStateChange();
+            });
+        }
+
+        if (redoButton) {
+            redoButton.addEventListener('click', () => {
+                if (!state.isEnabled || !state.isActive) return;
+                redoStateChange();
+            });
+        }
+
+        if (exportButton) {
+            exportButton.addEventListener('click', () => {
+                if (!state.isEnabled || !state.isActive) return;
+                exportStateSnapshot();
+            });
+        }
+
+        if (importButton && importInput) {
+            importButton.addEventListener('click', () => {
+                if (!state.isEnabled || !state.isActive) return;
+                if (typeof window !== 'undefined') {
+                    const confirmed = window.confirm('Импорт заменит текущее состояние. Продолжить?');
+                    if (!confirmed) return;
+                }
+                importInput.value = '';
+                importInput.click();
+            });
+
+            importInput.addEventListener('change', async (event) => {
+                const input = event.target;
+                const selectedFile = input.files && input.files[0];
+                if (selectedFile) {
+                    await importStateFromFile(selectedFile);
+                }
+                input.value = '';
+            });
+        }
+
+        state.panel = panel;
+        state.exportButton = exportButton;
+        state.importButton = importButton;
+        state.importInput = importInput;
+        state.undoButton = undoButton;
+        state.redoButton = redoButton;
+        state.panelInitialized = true;
+        updatePanelVisibility();
+        updateEditorHistoryButtons();
+    };
+
+    const applyEditableState = () => {
+        if (!documentAvailable) return;
+        initializeEditorPanel();
+        const elements = document.querySelectorAll('.js-editable');
+        elements.forEach((element) => {
+            const handler = state.handlers.get(element);
+            if (!state.isEnabled || !state.isActive) {
+                if (handler) {
+                    detachHandler(element);
+                }
+                if (element.hasAttribute('contenteditable')) {
+                    element.removeAttribute('contenteditable');
+                }
+                return;
+            }
+
+            if (!handler) {
+                const listener = createHandler(element);
+                element.addEventListener('input', listener);
+                element.addEventListener('blur', listener);
+                state.handlers.set(element, listener);
+            }
+
+            if (typeof computeEditorKey === 'function') {
+                computeEditorKey(element);
+            }
+            element.setAttribute('contenteditable', 'plaintext-only');
+        });
+        updatePanelVisibility();
+        refreshCatalogSortables();
+    };
+
+    const updateButtonState = () => {
+        if (!state.button) return;
+        const label = state.isActive ? 'Завершить редактирование' : 'Редактировать';
+        state.button.textContent = label;
+        state.button.setAttribute('aria-pressed', String(state.isActive));
+        state.button.setAttribute('aria-label', state.isActive ? 'Выключить режим редактирования' : 'Включить режим редактирования');
+    };
+
+    const updateBodyClass = () => {
+        const body = getBodyElement();
+        if (body) {
+            body.classList.toggle('editor-mode', Boolean(state.isEnabled && state.isActive));
+        }
+    };
+
+    const requestEditorAuthorization = async () => {
+        if (state.isAuthorized) {
+            return true;
+        }
+        if (state.authorizationPromise) {
+            return state.authorizationPromise;
+        }
+        const promise = ensureEditorPin({ allowCreate: true }).then((authorized) => {
+            state.authorizationPromise = null;
+            if (authorized) {
+                state.isAuthorized = true;
+            }
+            return authorized;
+        });
+        state.authorizationPromise = promise;
+        return promise;
+    };
+
+    const setupEditorButton = () => {
+        if (state.initialized) {
+            updateButtonState();
+            updateBodyClass();
+            applyEditableState();
+            return;
+        }
+
+        state.initialized = true;
+        state.button = documentAvailable ? document.getElementById('editor-toggle') : null;
+        initializeEditorPanel();
+
+        if (!state.button) {
+            applyEditableState();
+            return;
+        }
+
+        if (!state.isEnabled) {
+            state.button.style.display = 'none';
+            state.isActive = false;
+            state.isAuthorized = false;
+            state.authorizationPromise = null;
+            const body = getBodyElement();
+            if (body) {
+                body.classList.remove('editor-mode');
+            }
+            updatePanelVisibility();
+            updateBodyClass();
+            applyEditableState();
+            return;
+        }
+
+        state.button.style.display = 'block';
+        updateButtonState();
+        updateBodyClass();
+
+        state.button.addEventListener('click', async () => {
+            if (!state.isActive) {
+                const authorized = await requestEditorAuthorization();
+                if (!authorized) {
+                    return;
+                }
+                state.isActive = true;
+            } else {
+                state.isActive = false;
+            }
+            updateBodyClass();
+            updateButtonState();
+            applyEditableState();
+        });
+
+        applyEditableState();
+    };
+
+    window.editorMode = {
+        state,
+        refresh: applyEditableState,
+        setup: setupEditorButton,
+    };
+    updateEditorHistoryButtons();
+}
 
 function getHashForView(view) {
     const segment = VIEW_ROUTES[view] ?? '';
@@ -307,8 +850,26 @@ function escapeHtml(value) {
     return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+function buildEditorInputId(prefix, value) {
+    return `${prefix}-${String(value)}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+function resolveProductImage(product, { fallbackWidth = 400, fallbackHeight = 160 } = {}) {
+    if (!product) {
+        return PLACEHOLDER_IMAGE;
+    }
+    const override = state.items?.[product.id]?.img;
+    if (override) {
+        return override;
+    }
+    if (product.image) {
+        return product.image;
+    }
+    return `https://placehold.co/${fallbackWidth}x${fallbackHeight}/2563eb/ffffff?text=${String(product.name || '').substring(0, 10)}`;
+}
+
 // --- Глобальное Состояние ---
-let appState = {
+const legacyDefaultState = {
     products: [],
     cartItems: {},
     view: 'home', // 'home', 'catalog', 'cart', 'checkout', 'admin', 'details', 'online-calc', 'payment', 'delivery', 'about', 'contacts'
@@ -809,8 +1370,678 @@ let appState = {
     }
 };
 
+const DEFAULT_CHECKOUT_STATE = {
+    customerType: 'physical',
+    deliveryMethod: 'company',
+    paymentMethod: 'cash',
+};
+
+function cloneCatalogCategory(category) {
+    if (!category || typeof category !== 'object') return null;
+    const cloned = { ...category };
+    cloned.keywords = Array.isArray(category.keywords) ? [...category.keywords] : [];
+    cloned.links = Array.isArray(category.links) ? [...category.links] : [];
+    cloned.subcategories = Array.isArray(category.subcategories)
+        ? category.subcategories.map((sub) => ({
+            ...sub,
+            keywords: Array.isArray(sub.keywords) ? [...sub.keywords] : [],
+        }))
+        : [];
+    return cloned;
+}
+
+function createDefaultState() {
+    const base = legacyDefaultState;
+    const catalogCategories = Array.isArray(base.catalogCategories)
+        ? base.catalogCategories.map((category) => cloneCatalogCategory(category) || null).filter(Boolean)
+        : [];
+    const defaultGroupsOrder = catalogCategories
+        .map((category) => String(category?.slug || '').trim())
+        .filter(Boolean);
+    const defaultItemsOrder = {};
+    catalogCategories.forEach((category) => {
+        const groupSlug = String(category?.slug || '').trim();
+        if (!groupSlug) return;
+        defaultItemsOrder[groupSlug] = Array.isArray(category?.subcategories)
+            ? category.subcategories
+                .map((sub) => String(sub?.slug || '').trim())
+                .filter(Boolean)
+            : [];
+    });
+    return {
+        texts: {},
+        groups: {
+            catalogCategories,
+        },
+        items: {
+            products: Array.isArray(base.products) ? [...base.products] : [],
+            cartItems: base.cartItems ? { ...base.cartItems } : {},
+        },
+        layout: {
+            view: base.view || 'home',
+            selectedProductId: base.selectedProductId || null,
+            lastViewBeforeDetails: base.lastViewBeforeDetails || 'catalog',
+            isMenuOpen: Boolean(base.isMenuOpen),
+            isCatalogMenuOpen: Boolean(base.isCatalogMenuOpen),
+            selectedCategorySlug: base.selectedCategorySlug || null,
+            selectedSubcategorySlug: base.selectedSubcategorySlug || null,
+            activeSlide: Number.isFinite(base.activeSlide) ? base.activeSlide : 0,
+            slides: Array.isArray(base.slides) ? base.slides.map((slide) => ({ ...slide })) : [],
+            groupsOrder: defaultGroupsOrder,
+            itemsOrderByGroup: defaultItemsOrder,
+        },
+        meta: {
+            message: base.message || '',
+            searchTerm: base.searchTerm || '',
+            sortBy: base.sortBy || 'name-asc',
+            onlyWithPrice: Boolean(base.onlyWithPrice),
+            checkoutState: { ...DEFAULT_CHECKOUT_STATE, ...(base.checkoutState || {}) },
+        },
+    };
+}
+
+let state = createDefaultState();
+if (typeof window !== 'undefined') {
+    window.state = state;
+}
+
 let sliderInterval;
 let catalogMenuTimeout; // Для задержки закрытия меню
+
+let stateSaveTimeoutId = null;
+let localforageLoaderPromise = null;
+let catalogGroupsSortable = null;
+const catalogItemSortables = new Map();
+
+const STATE_KEY_PATHS = {
+    products: ['items', 'products'],
+    cartItems: ['items', 'cartItems'],
+    view: ['layout', 'view'],
+    selectedProductId: ['layout', 'selectedProductId'],
+    lastViewBeforeDetails: ['layout', 'lastViewBeforeDetails'],
+    isMenuOpen: ['layout', 'isMenuOpen'],
+    isCatalogMenuOpen: ['layout', 'isCatalogMenuOpen'],
+    selectedCategorySlug: ['layout', 'selectedCategorySlug'],
+    selectedSubcategorySlug: ['layout', 'selectedSubcategorySlug'],
+    activeSlide: ['layout', 'activeSlide'],
+    slides: ['layout', 'slides'],
+    groupsOrder: ['layout', 'groupsOrder'],
+    itemsOrderByGroup: ['layout', 'itemsOrderByGroup'],
+    message: ['meta', 'message'],
+    searchTerm: ['meta', 'searchTerm'],
+    sortBy: ['meta', 'sortBy'],
+    onlyWithPrice: ['meta', 'onlyWithPrice'],
+    checkoutState: ['meta', 'checkoutState'],
+};
+
+function ensureLocalforage() {
+    if (typeof window !== 'undefined' && window.localforage) {
+        return Promise.resolve(window.localforage);
+    }
+    if (localforageLoaderPromise) {
+        return localforageLoaderPromise;
+    }
+    if (typeof document === 'undefined') {
+        return Promise.resolve(null);
+    }
+    localforageLoaderPromise = new Promise((resolve) => {
+        const script = document.createElement('script');
+        script.src = 'https://cdn.jsdelivr.net/npm/localforage@1.10.0/dist/localforage.min.js';
+        script.async = true;
+        script.onload = () => resolve(window.localforage || null);
+        script.onerror = () => {
+            console.warn('[STATE:SKIP]', 'storage', 'Не удалось загрузить localForage');
+            resolve(null);
+        };
+        document.head.appendChild(script);
+    });
+    return localforageLoaderPromise;
+}
+
+async function getStateStorage() {
+    try {
+        const lf = await ensureLocalforage();
+        return lf || null;
+    } catch (error) {
+        console.warn('[STATE:SKIP]', 'storage', `Ошибка при инициализации localForage: ${error.message}`);
+        return null;
+    }
+}
+
+async function pruneStateBackups(storage) {
+    if (!storage || typeof storage.keys !== 'function') return;
+    try {
+        const keys = await storage.keys();
+        const backupKeys = keys.filter((key) => key.startsWith(STATE_BACKUP_PREFIX));
+        if (backupKeys.length <= MAX_STATE_BACKUPS) return;
+        const sorted = backupKeys.sort((a, b) => b.localeCompare(a));
+        const excess = sorted.slice(MAX_STATE_BACKUPS);
+        await Promise.all(excess.map((key) => storage.removeItem(key)));
+    } catch (error) {
+        console.warn('[STATE:SKIP]', 'storage', `Не удалось очистить старые резервные копии: ${error.message}`);
+    }
+}
+
+function cloneStateSnapshot() {
+    return JSON.parse(JSON.stringify(state));
+}
+
+function buildStateExportFileName() {
+    const now = new Date();
+    const pad = (value) => String(value).padStart(2, '0');
+    return `site-state-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}.json`;
+}
+
+function downloadJsonFile(fileName, jsonString) {
+    if (typeof document === 'undefined' || !document.body) return;
+    const blob = new Blob([jsonString], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = fileName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
+}
+
+function exportStateSnapshot() {
+    try {
+        const snapshot = cloneStateSnapshot();
+        const jsonString = JSON.stringify(snapshot, null, 2);
+        downloadJsonFile(buildStateExportFileName(), jsonString);
+    } catch (error) {
+        console.error('[EDITOR:EXPORT]', error);
+        setMessage('Не удалось экспортировать состояние.');
+    }
+}
+
+function validateImportedSnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') {
+        throw new Error('Некорректный JSON-файл.');
+    }
+    const requiredKeys = ['items', 'groups', 'layout', 'texts'];
+    const missing = requiredKeys.filter((key) => !Object.prototype.hasOwnProperty.call(snapshot, key));
+    if (missing.length) {
+        throw new Error(`Отсутствуют обязательные поля: ${missing.join(', ')}`);
+    }
+    if (typeof snapshot.items !== 'object' || snapshot.items === null) {
+        throw new Error('Поле "items" должно быть объектом.');
+    }
+    if (typeof snapshot.groups !== 'object' || snapshot.groups === null) {
+        throw new Error('Поле "groups" должно быть объектом.');
+    }
+    if (typeof snapshot.layout !== 'object' || snapshot.layout === null) {
+        throw new Error('Поле "layout" должно быть объектом.');
+    }
+    if (typeof snapshot.texts !== 'object' || snapshot.texts === null) {
+        throw new Error('Поле "texts" должно быть объектом.');
+    }
+    return snapshot;
+}
+
+async function applyImportedSnapshot(importedState) {
+    const defaults = createDefaultState();
+    const merged = mergeState(defaults, importedState);
+    const normalizedProducts = normalizeCatalog(
+        Array.isArray(merged.items?.products) ? merged.items.products : []
+    );
+    merged.items.products = normalizedProducts.length
+        ? normalizedProducts
+        : normalizeCatalog(FALLBACK_PRODUCTS);
+
+    if (Array.isArray(merged.groups?.catalogCategories)) {
+        merged.groups.catalogCategories = merged.groups.catalogCategories.map(
+            (category) => cloneCatalogCategory(category) || null
+        ).filter(Boolean);
+    }
+
+    const undoSnapshot = prepareUndoSnapshot();
+    state = merged;
+    if (typeof window !== 'undefined') {
+        window.state = state;
+    }
+
+    activeTextEditKeys.clear();
+    commitUndoSnapshot(undoSnapshot);
+
+    ensureLayoutOrdering();
+
+    if (stateSaveTimeoutId) {
+        clearTimeout(stateSaveTimeoutId);
+        stateSaveTimeoutId = null;
+    }
+
+    destroyCatalogSortables();
+    stopSlider();
+    render();
+    if (state.layout.view === 'home') {
+        startSlider();
+    }
+
+    if (window.editorMode) {
+        window.editorMode.refresh();
+        refreshCatalogSortables();
+    }
+
+    await saveStateSnapshot(true);
+    setMessage('Состояние успешно импортировано.');
+}
+
+async function importStateFromFile(file) {
+    try {
+        const text = await file.text();
+        const parsed = JSON.parse(text);
+        const snapshot = validateImportedSnapshot(parsed);
+        await applyImportedSnapshot(snapshot);
+    } catch (error) {
+        console.error('[EDITOR:IMPORT]', error);
+        setMessage(`Ошибка импорта: ${error.message}`);
+    }
+}
+
+function arraysEqual(first, second) {
+    if (first === second) return true;
+    if (!Array.isArray(first) || !Array.isArray(second)) return false;
+    if (first.length !== second.length) return false;
+    for (let index = 0; index < first.length; index += 1) {
+        if (first[index] !== second[index]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function ensureLayoutOrdering({ persist = false } = {}) {
+    const categories = Array.isArray(state.groups?.catalogCategories)
+        ? state.groups.catalogCategories
+        : [];
+    const categorySlugs = categories
+        .map((category) => String(category?.slug || '').trim())
+        .filter(Boolean);
+
+    const currentGroupOrder = Array.isArray(state.layout?.groupsOrder)
+        ? state.layout.groupsOrder
+        : [];
+    const sanitizedGroupOrder = currentGroupOrder.filter((slug) => categorySlugs.includes(slug));
+    let groupsChanged = sanitizedGroupOrder.length !== currentGroupOrder.length;
+    categorySlugs.forEach((slug) => {
+        if (!sanitizedGroupOrder.includes(slug)) {
+            sanitizedGroupOrder.push(slug);
+            groupsChanged = true;
+        }
+    });
+
+    const currentItemsOrder = state.layout?.itemsOrderByGroup && typeof state.layout.itemsOrderByGroup === 'object'
+        ? state.layout.itemsOrderByGroup
+        : {};
+    const nextItemsOrder = {};
+    let itemsChanged = false;
+
+    categories.forEach((category) => {
+        const groupSlug = String(category?.slug || '').trim();
+        if (!groupSlug) return;
+        const subcategorySlugs = Array.isArray(category?.subcategories)
+            ? category.subcategories.map((sub) => String(sub?.slug || '').trim()).filter(Boolean)
+            : [];
+        const savedOrder = Array.isArray(currentItemsOrder[groupSlug])
+            ? currentItemsOrder[groupSlug]
+            : [];
+        const sanitizedItems = savedOrder.filter((slug) => subcategorySlugs.includes(slug));
+        if (sanitizedItems.length !== savedOrder.length) {
+            itemsChanged = true;
+        }
+        subcategorySlugs.forEach((slug) => {
+            if (!sanitizedItems.includes(slug)) {
+                sanitizedItems.push(slug);
+                itemsChanged = true;
+            }
+        });
+        nextItemsOrder[groupSlug] = sanitizedItems;
+    });
+
+    const existingGroupKeys = Object.keys(currentItemsOrder);
+    const nextGroupKeys = Object.keys(nextItemsOrder);
+    if (!itemsChanged && existingGroupKeys.length !== nextGroupKeys.length) {
+        itemsChanged = true;
+    }
+    if (!itemsChanged) {
+        itemsChanged = nextGroupKeys.some((key) => !arraysEqual(currentItemsOrder[key] || [], nextItemsOrder[key] || []));
+    }
+
+    if (!arraysEqual(sanitizedGroupOrder, state.layout.groupsOrder || [])) {
+        groupsChanged = true;
+    }
+
+    if (groupsChanged) {
+        state.layout.groupsOrder = sanitizedGroupOrder;
+    }
+    if (itemsChanged) {
+        state.layout.itemsOrderByGroup = nextItemsOrder;
+    }
+
+    if ((groupsChanged || itemsChanged) && persist) {
+        scheduleStateSave();
+    }
+
+    return groupsChanged || itemsChanged;
+}
+
+function destroyCatalogSortables() {
+    if (catalogGroupsSortable) {
+        catalogGroupsSortable.destroy();
+        catalogGroupsSortable = null;
+    }
+    catalogItemSortables.forEach((instance) => instance.destroy());
+    catalogItemSortables.clear();
+}
+
+function refreshCatalogSortables() {
+    if (typeof document === 'undefined') return;
+    const editorState = window.editorMode?.state;
+    const isEditorActive = Boolean(editorState?.isEnabled && editorState.isActive);
+    if (!isEditorActive || typeof Sortable === 'undefined' || state.layout.view !== 'catalog') {
+        destroyCatalogSortables();
+        return;
+    }
+
+    const groupsContainer = document.querySelector('[data-groups-container="catalog"]');
+    if (!groupsContainer) {
+        destroyCatalogSortables();
+        return;
+    }
+
+    destroyCatalogSortables();
+
+    catalogGroupsSortable = new Sortable(groupsContainer, {
+        animation: 150,
+        handle: '.js-drag',
+        fallbackOnBody: true,
+        draggable: '[data-group-id]',
+        onEnd: () => {
+            const nextOrder = Array.from(groupsContainer.querySelectorAll('[data-group-id]'))
+                .map((element) => element.getAttribute('data-group-id'))
+                .filter(Boolean);
+            if (!arraysEqual(nextOrder, state.layout.groupsOrder || [])) {
+                setState({ groupsOrder: nextOrder });
+            }
+        },
+    });
+
+    const itemsContainers = groupsContainer.querySelectorAll('[data-items-container]');
+    itemsContainers.forEach((container) => {
+        const groupId = container.getAttribute('data-items-container');
+        if (!groupId) return;
+        const sortableInstance = new Sortable(container, {
+            animation: 150,
+            handle: '.js-drag',
+            fallbackOnBody: true,
+            draggable: '[data-item-id]',
+            onEnd: () => {
+                const nextItemsOrder = Array.from(container.querySelectorAll('[data-item-id]'))
+                    .map((element) => element.getAttribute('data-item-id'))
+                    .filter(Boolean);
+                const currentOrder = state.layout.itemsOrderByGroup?.[groupId] || [];
+                if (!arraysEqual(nextItemsOrder, currentOrder)) {
+                    const existing = state.layout.itemsOrderByGroup && typeof state.layout.itemsOrderByGroup === 'object'
+                        ? state.layout.itemsOrderByGroup
+                        : {};
+                    setState({ itemsOrderByGroup: { ...existing, [groupId]: nextItemsOrder } });
+                }
+            },
+        });
+        catalogItemSortables.set(groupId, sortableInstance);
+    });
+}
+
+async function saveStateSnapshot(immediate = false) {
+    const generation = markStateDirty();
+    const storage = await getStateStorage();
+    if (!storage) return;
+    const persist = async () => {
+        try {
+            const current = await storage.getItem(STATE_STORAGE_KEY);
+            if (current) {
+                const backupKey = `${STATE_BACKUP_PREFIX}${Date.now()}`;
+                await storage.setItem(backupKey, current);
+                await pruneStateBackups(storage);
+            }
+            await storage.setItem(STATE_STORAGE_KEY, cloneStateSnapshot());
+            markStateSaved(generation);
+        } catch (error) {
+            console.warn('[STATE:SKIP]', 'storage', `Не удалось сохранить состояние: ${error.message}`);
+        }
+    };
+    if (immediate) {
+        if (stateSaveTimeoutId) {
+            clearTimeout(stateSaveTimeoutId);
+            stateSaveTimeoutId = null;
+        }
+        await persist();
+        return;
+    }
+    if (stateSaveTimeoutId) {
+        clearTimeout(stateSaveTimeoutId);
+    }
+    stateSaveTimeoutId = window.setTimeout(() => {
+        stateSaveTimeoutId = null;
+        persist();
+    }, STATE_SAVE_DEBOUNCE);
+}
+
+function scheduleStateSave() {
+    return saveStateSnapshot(false);
+}
+
+function applyStatePatch(partial = {}) {
+    const changedKeys = [];
+    for (const [key, value] of Object.entries(partial)) {
+        const path = STATE_KEY_PATHS[key];
+        if (!path) continue;
+        let target = state;
+        for (let i = 0; i < path.length - 1; i += 1) {
+            if (!target[path[i]]) {
+                target[path[i]] = {};
+            }
+            target = target[path[i]];
+        }
+        const lastKey = path[path.length - 1];
+        const previous = target[lastKey];
+        const nextValue = value;
+        const hasChanged = JSON.stringify(previous) !== JSON.stringify(nextValue);
+        if (hasChanged) {
+            target[lastKey] = nextValue;
+            changedKeys.push(key);
+        }
+    }
+    return changedKeys;
+}
+
+function mergeState(defaultState, storedState) {
+    if (!storedState || typeof storedState !== 'object') {
+        return defaultState;
+    }
+    const merged = createDefaultState();
+    merged.texts = { ...defaultState.texts, ...(storedState.texts || {}) };
+    merged.groups.catalogCategories = Array.isArray(storedState.groups?.catalogCategories) && storedState.groups.catalogCategories.length
+        ? storedState.groups.catalogCategories.map((category) => cloneCatalogCategory(category) || null).filter(Boolean)
+        : defaultState.groups.catalogCategories.map((category) => cloneCatalogCategory(category) || null).filter(Boolean);
+    merged.items.products = Array.isArray(storedState.items?.products) && storedState.items.products.length
+        ? storedState.items.products
+        : defaultState.items.products;
+    merged.items.cartItems = storedState.items?.cartItems ? { ...storedState.items.cartItems } : { ...defaultState.items.cartItems };
+    if (storedState.items && typeof storedState.items === 'object') {
+        for (const [key, value] of Object.entries(storedState.items)) {
+            if (key === 'products' || key === 'cartItems') continue;
+            try {
+                merged.items[key] = JSON.parse(JSON.stringify(value));
+            } catch (error) {
+                merged.items[key] = value;
+            }
+        }
+    }
+    merged.layout = {
+        ...defaultState.layout,
+        ...(storedState.layout || {}),
+        slides: Array.isArray(storedState.layout?.slides) && storedState.layout.slides.length
+            ? storedState.layout.slides.map((slide) => ({ ...slide }))
+            : defaultState.layout.slides.map((slide) => ({ ...slide })),
+    };
+    merged.meta = {
+        ...defaultState.meta,
+        ...(storedState.meta || {}),
+        checkoutState: {
+            ...defaultState.meta.checkoutState,
+            ...(storedState.meta?.checkoutState || {}),
+        },
+    };
+    return merged;
+}
+
+async function initializeState() {
+    const defaults = createDefaultState();
+    let storedState = null;
+    const storage = await getStateStorage();
+    if (storage) {
+        try {
+            storedState = await storage.getItem(STATE_STORAGE_KEY);
+        } catch (error) {
+            console.warn('[STATE:SKIP]', 'storage', `Не удалось загрузить состояние: ${error.message}`);
+        }
+    }
+    state = mergeState(defaults, storedState);
+    const normalizedProducts = normalizeCatalog(state.items.products.length ? state.items.products : window.FULL_CATALOG);
+    state.items.products = normalizedProducts;
+    if (!state.items.products.length) {
+        state.items.products = normalizeCatalog(FALLBACK_PRODUCTS);
+    }
+    if (!state.groups.catalogCategories.length) {
+        state.groups.catalogCategories = defaults.groups.catalogCategories;
+    }
+    if (!state.layout.slides.length) {
+        state.layout.slides = defaults.layout.slides;
+    }
+    ensureLayoutOrdering({ persist: true });
+    if (storage && !storedState) {
+        await saveStateSnapshot(true);
+    }
+}
+
+function computeEditorKey(element) {
+    if (!element || typeof element !== 'object') return null;
+    if (element.dataset && element.dataset.editKey) {
+        return element.dataset.editKey;
+    }
+    if (typeof document === 'undefined') return null;
+    const path = [];
+    let node = element;
+    while (node && node !== document.body) {
+        let index = 0;
+        let sibling = node.previousElementSibling;
+        while (sibling) {
+            if (sibling.tagName === node.tagName) {
+                index += 1;
+            }
+            sibling = sibling.previousElementSibling;
+        }
+        path.unshift(`${node.tagName.toLowerCase()}:${index}`);
+        node = node.parentElement;
+    }
+    const key = path.join('/');
+    if (element.dataset) {
+        element.dataset.editKey = key;
+    }
+    return key;
+}
+
+function applyStoredTextsToElement(element) {
+    const key = computeEditorKey(element);
+    if (!key) return;
+    if (Object.prototype.hasOwnProperty.call(state.texts, key)) {
+        const targetText = state.texts[key];
+        if (element.textContent !== targetText) {
+            element.textContent = targetText;
+        }
+    }
+}
+
+function captureMissingText(element) {
+    const key = computeEditorKey(element);
+    if (!key) return false;
+    if (!Object.prototype.hasOwnProperty.call(state.texts, key)) {
+        state.texts[key] = element.textContent ?? '';
+        return true;
+    }
+    return false;
+}
+
+function syncEditableContent({ captureMissing = false } = {}) {
+    if (typeof document === 'undefined') return false;
+    const elements = document.querySelectorAll('.js-editable');
+    let stateChanged = false;
+    elements.forEach((element) => {
+        if (captureMissing) {
+            const added = captureMissingText(element);
+            stateChanged = stateChanged || added;
+        }
+        applyStoredTextsToElement(element);
+    });
+    if (stateChanged) {
+        scheduleStateSave();
+    }
+    return stateChanged;
+}
+
+function handleEditorChanged(event) {
+    const element = event?.target;
+    if (!element || typeof element !== 'object') return;
+    const key = computeEditorKey(element);
+    if (!key) return;
+    const text = element.textContent ?? '';
+    const trigger = event?.detail?.trigger || null;
+    const previousText = state.texts[key];
+
+    if (previousText === text) {
+        if (trigger === 'blur') {
+            activeTextEditKeys.delete(key);
+        }
+        return;
+    }
+
+    if (!activeTextEditKeys.has(key)) {
+        const snapshot = prepareUndoSnapshot();
+        commitUndoSnapshot(snapshot);
+        activeTextEditKeys.add(key);
+    }
+
+    state.texts[key] = text;
+    scheduleStateSave();
+
+    if (trigger === 'blur') {
+        activeTextEditKeys.delete(key);
+    }
+}
+
+if (typeof document !== 'undefined') {
+    const globalObject = typeof window !== 'undefined' ? window : null;
+    if (globalObject && !globalObject.__editorChangeListenerAttached) {
+        document.addEventListener('editor:changed', handleEditorChanged);
+        globalObject.__editorChangeListenerAttached = true;
+    } else if (!globalObject) {
+        document.addEventListener('editor:changed', handleEditorChanged);
+    }
+}
+
+if (typeof window !== 'undefined') {
+    window.applyStatePatch = applyStatePatch;
+    window.scheduleStateSave = scheduleStateSave;
+    window.syncEditableContent = syncEditableContent;
+    window.computeEditorKey = computeEditorKey;
+    window.initializeSiteState = initializeState;
+    window.saveStateSnapshot = saveStateSnapshot;
+    window.ensureLocalforage = ensureLocalforage;
+    window.isStateDirty = isStateDirty;
+}
 
 // Внутреннее состояние формы администратора
 window.adminState = {
@@ -821,21 +2052,13 @@ window.adminState = {
 
 // --- Утилиты ---
 
-function persistProducts(products) {
-    try {
-        localStorage.setItem(PRODUCTS_STORAGE_KEY, JSON.stringify({ schemaVersion: SCHEMA_VERSION, products }));
-    } catch (error) {
-        console.warn('[CATALOG:SKIP]', 'storage', `Не удалось сохранить каталог: ${error.message}`);
-    }
-}
-
 function navigateToRoute(view, { replace = false, categorySlug = null, subcategorySlug = null } = {}) {
     let hash;
     if (view === 'category') {
-        hash = buildCategoryHash(categorySlug || appState.selectedCategorySlug);
+        hash = buildCategoryHash(categorySlug || state.layout.selectedCategorySlug);
     } else if (view === 'subcategory') {
-        const targetCategory = categorySlug || appState.selectedCategorySlug;
-        const targetSubcategory = subcategorySlug || appState.selectedSubcategorySlug;
+        const targetCategory = categorySlug || state.layout.selectedCategorySlug;
+        const targetSubcategory = subcategorySlug || state.layout.selectedSubcategorySlug;
         hash = buildSubcategoryHash(targetCategory, targetSubcategory);
     } else {
         hash = getHashForView(view);
@@ -850,95 +2073,12 @@ function navigateToRoute(view, { replace = false, categorySlug = null, subcatego
     }
 }
 
-/**
- * Загружает товары и корзину, учитывая актуальную схему данных и резервный каталог.
- */
-function loadState() {
-    let products = [];
-
-    try {
-        const stored = localStorage.getItem(PRODUCTS_STORAGE_KEY);
-        if (stored) {
-            const parsed = JSON.parse(stored);
-            if (parsed?.schemaVersion === SCHEMA_VERSION && Array.isArray(parsed.products)) {
-                const normalizedStored = normalizeCatalog(parsed.products);
-                if (normalizedStored.length > 0) {
-                    products = normalizedStored;
-                }
-            }
-        }
-    } catch (error) {
-        console.warn('[CATALOG:SKIP]', 'storage', `Ошибка чтения каталога из localStorage: ${error.message}`);
-    }
-
-    if (!products.length) {
-        const sourceCatalog = Array.isArray(window.FULL_CATALOG) && window.FULL_CATALOG.length
-            ? normalizeCatalog(window.FULL_CATALOG)
-            : [];
-        if (sourceCatalog.length) {
-            products = sourceCatalog;
-        } else {
-            products = normalizeCatalog([
-                {
-                    id: 'demo-1',
-                    name: 'Пеноблок D600 (600x200x300)',
-                    price: 350,
-                    unit: 'шт',
-                    category: 'Демо-товары',
-                    description: 'Легкий и прочный пеноблок.',
-                    image: 'https://placehold.co/400x300/4a7a9c/ffffff?text=Пеноблок',
-                },
-            ]);
-        }
-        persistProducts(products);
-    }
-
-    appState.products = products;
-
-    try {
-        const storedCart = localStorage.getItem(CART_STORAGE_KEY);
-        if (storedCart) {
-            const parsedCart = JSON.parse(storedCart);
-            if (parsedCart && typeof parsedCart === 'object') {
-                const cleanedCart = {};
-                Object.entries(parsedCart).forEach(([key, item]) => {
-                    const product = products.find(p => String(p.id) === String(key));
-                    if (!product || !product.hasPrice) return;
-                    const quantity = Number(item.quantity) || 0;
-                    if (quantity <= 0) return;
-                    cleanedCart[key] = {
-                        id: product.id,
-                        name: product.name,
-                        price: product.price,
-                        unit: product.unit,
-                        quantity,
-                    };
-                });
-                appState.cartItems = cleanedCart;
-            }
-        }
-    } catch (error) {
-        console.warn('[CATALOG:SKIP]', 'cart', `Ошибка чтения корзины: ${error.message}`);
-    }
-
-    persistProducts(appState.products);
-}
-
-function saveState() {
-    persistProducts(appState.products);
-    try {
-        localStorage.setItem(CART_STORAGE_KEY, JSON.stringify(appState.cartItems));
-    } catch (error) {
-        console.warn('[CATALOG:SKIP]', 'cart', `Не удалось сохранить корзину: ${error.message}`);
-    }
-}
-
 function applyInitialRoute() {
     const hashSegment = getCurrentHashSegment();
     const normalizedSegment = hashSegment.toLowerCase();
     if (normalizedSegment.startsWith('product/')) {
         const slug = decodeURIComponent(hashSegment.slice(hashSegment.indexOf('/') + 1));
-        const product = appState.products.find(p => p.slug === slug);
+        const product = state.items.products.find(p => p.slug === slug);
         if (product) {
             showDetails(product.id, { skipHistory: true, lastViewOverride: 'catalog' });
             updateHash(buildProductHash(product.slug), { replace: true });
@@ -1010,7 +2150,7 @@ function handleHashChange() {
     const normalizedSegment = hashSegment.toLowerCase();
     if (normalizedSegment.startsWith('product/')) {
         const slug = decodeURIComponent(hashSegment.slice(hashSegment.indexOf('/') + 1));
-        const product = appState.products.find(p => p.slug === slug);
+        const product = state.items.products.find(p => p.slug === slug);
         if (product) {
             showDetails(product.id, { skipHistory: true });
             return;
@@ -1071,8 +2211,16 @@ function handleHashChange() {
 // --- Управление Состоянием ---
 
 function setState(newState, callback = null) {
-    Object.assign(appState, newState);
-    saveState();
+    const undoSnapshot = prepareUndoSnapshot();
+    const changedKeys = applyStatePatch(newState || {});
+    if (!changedKeys.length) {
+        if (callback) callback();
+        return;
+    }
+    if (changedKeys.some((key) => HISTORY_TRACKED_KEYS.has(key))) {
+        commitUndoSnapshot(undoSnapshot);
+    }
+    scheduleStateSave();
     render();
     if (callback) callback();
 }
@@ -1090,13 +2238,13 @@ function setView(newView, options = {}) {
     };
 
     if (newView === 'category') {
-        const categorySlug = options.categorySlug || appState.selectedCategorySlug || null;
+        const categorySlug = options.categorySlug || state.layout.selectedCategorySlug || null;
         statePatch.selectedCategorySlug = categorySlug;
         statePatch.selectedSubcategorySlug = null;
         statePatch.searchTerm = '';
     } else if (newView === 'subcategory') {
-        const categorySlug = options.categorySlug || appState.selectedCategorySlug || null;
-        const subcategorySlug = options.subcategorySlug || appState.selectedSubcategorySlug || null;
+        const categorySlug = options.categorySlug || state.layout.selectedCategorySlug || null;
+        const subcategorySlug = options.subcategorySlug || state.layout.selectedSubcategorySlug || null;
         statePatch.selectedCategorySlug = categorySlug;
         statePatch.selectedSubcategorySlug = subcategorySlug;
         statePatch.searchTerm = '';
@@ -1112,18 +2260,18 @@ function setView(newView, options = {}) {
     }
 
     if (newView !== 'details') {
-        appState.lastViewBeforeDetails = newView;
+        statePatch.lastViewBeforeDetails = newView;
     }
 
     setState(statePatch, () => {
         if (newView !== 'details' && !options.skipHistory) {
             const navigationOptions = { replace: options.replaceHistory };
             if (newView === 'category') {
-                navigationOptions.categorySlug = statePatch.selectedCategorySlug || appState.selectedCategorySlug;
+                navigationOptions.categorySlug = statePatch.selectedCategorySlug || state.layout.selectedCategorySlug;
             }
             if (newView === 'subcategory') {
-                navigationOptions.categorySlug = statePatch.selectedCategorySlug || appState.selectedCategorySlug;
-                navigationOptions.subcategorySlug = statePatch.selectedSubcategorySlug || appState.selectedSubcategorySlug;
+                navigationOptions.categorySlug = statePatch.selectedCategorySlug || state.layout.selectedCategorySlug;
+                navigationOptions.subcategorySlug = statePatch.selectedSubcategorySlug || state.layout.selectedSubcategorySlug;
             }
             navigateToRoute(newView, navigationOptions);
         }
@@ -1131,16 +2279,17 @@ function setView(newView, options = {}) {
 }
 
 function showDetails(productId, options = {}) {
-    const product = appState.products.find(p => String(p.id) === String(productId));
+    const product = state.items.products.find(p => String(p.id) === String(productId));
     if (!product) {
         console.warn('[CATALOG:SKIP]', productId, 'Продукт не найден при открытии карточки');
         return;
     }
 
+    const detailState = { view: 'details', selectedProductId: product.id };
     if (Object.prototype.hasOwnProperty.call(options, 'lastViewOverride')) {
-        appState.lastViewBeforeDetails = options.lastViewOverride;
-    } else if (appState.view !== 'details') {
-        appState.lastViewBeforeDetails = appState.view;
+        detailState.lastViewBeforeDetails = options.lastViewOverride;
+    } else if (state.layout.view !== 'details') {
+        detailState.lastViewBeforeDetails = state.layout.view;
     }
 
     if (!options.skipHistory) {
@@ -1152,22 +2301,22 @@ function showDetails(productId, options = {}) {
         }
     }
 
-    setState({ view: 'details', selectedProductId: product.id }, options.callback || null);
+    setState(detailState, options.callback || null);
 }
 
 function exitProductDetails() {
-    const targetView = appState.lastViewBeforeDetails || 'catalog';
+    const targetView = state.layout.lastViewBeforeDetails || 'catalog';
     setView(targetView, { replaceHistory: true });
 }
 
 function toggleMenu() {
-    setState({ isMenuOpen: !appState.isMenuOpen });
+    setState({ isMenuOpen: !state.layout.isMenuOpen });
 }
 
 function setCatalogMenu(isOpen) {
     clearTimeout(catalogMenuTimeout);
     if (isOpen) {
-        if (!appState.isCatalogMenuOpen) {
+        if (!state.layout.isCatalogMenuOpen) {
             setState({ isCatalogMenuOpen: true });
         }
     } else {
@@ -1204,8 +2353,11 @@ function handleSubcategoryClick(categorySlug, subcategorySlug) {
 }
 
 function handleSearch(term) {
-    appState.searchTerm = term;
-    if (appState.view !== 'catalog') {
+    const changed = applyStatePatch({ searchTerm: term });
+    if (changed.length) {
+        scheduleStateSave();
+    }
+    if (state.layout.view !== 'catalog') {
         setView('catalog');
     } else {
         renderProductGridOnly(); // Только перерисовываем товары, а не всю страницу
@@ -1214,10 +2366,12 @@ function handleSearch(term) {
 
 function setOnlyWithPrice(isChecked) {
     const newValue = Boolean(isChecked);
-    if (appState.onlyWithPrice === newValue) return;
-    if (appState.view === 'catalog') {
-        appState.onlyWithPrice = newValue;
-        saveState();
+    if (state.meta.onlyWithPrice === newValue) return;
+    if (state.layout.view === 'catalog') {
+        const changed = applyStatePatch({ onlyWithPrice: newValue });
+        if (changed.length) {
+            scheduleStateSave();
+        }
         renderProductGridOnly();
     } else {
         setState({ onlyWithPrice: newValue });
@@ -1225,8 +2379,11 @@ function setOnlyWithPrice(isChecked) {
 }
 
 function handleCheckoutChange(field, value) {
-    const newCheckoutState = { ...appState.checkoutState, [field]: value };
-    appState.checkoutState = newCheckoutState;
+    const newCheckoutState = { ...state.meta.checkoutState, [field]: value };
+    const changed = applyStatePatch({ checkoutState: newCheckoutState });
+    if (changed.length) {
+        scheduleStateSave();
+    }
     renderCheckoutPage(true);
 }
 
@@ -1243,7 +2400,7 @@ function handlePlaceOrder(event) {
 function startSlider() {
     stopSlider();
     sliderInterval = setInterval(() => {
-        const nextSlide = (appState.activeSlide + 1) % appState.slides.length;
+        const nextSlide = (state.layout.activeSlide + 1) % state.layout.slides.length;
         setState({ activeSlide: nextSlide });
     }, 5000);
 }
@@ -1266,10 +2423,10 @@ function setActiveSlide(index) {
  * Возвращает список товаров с учётом поиска, фильтра «Только с ценой» и сортировки.
  */
 function getVisibleProducts() {
-    const searchTerm = appState.searchTerm.trim().toLowerCase();
-    let filteredProducts = [...appState.products];
+    const searchTerm = state.meta.searchTerm.trim().toLowerCase();
+    let filteredProducts = [...state.items.products];
 
-    if (appState.onlyWithPrice) {
+    if (state.meta.onlyWithPrice) {
         filteredProducts = filteredProducts.filter(product => product.hasPrice);
     }
 
@@ -1292,7 +2449,7 @@ function getVisibleProducts() {
         return 0;
     };
 
-    switch (appState.sortBy) {
+    switch (state.meta.sortBy) {
         case 'price-asc':
             sortedProducts.sort((a, b) => {
                 const nullCheck = pushNullPricesToEnd(a, b);
@@ -1341,41 +2498,114 @@ function formatProductCount(count) {
 }
 
 function calculateTotalCost() {
-    return Object.values(appState.cartItems).reduce((sum, item) => {
+    return Object.values(state.items.cartItems).reduce((sum, item) => {
         if (!item || typeof item.price !== 'number' || Number.isNaN(item.price)) return sum;
         return sum + (item.quantity * item.price);
     }, 0);
 }
 function calculateCartCount() {
-    return Object.values(appState.cartItems).reduce((sum, item) => sum + item.quantity, 0);
+    return Object.values(state.items.cartItems).reduce((sum, item) => sum + item.quantity, 0);
+}
+
+function readFileAsDataUrl(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error('Не удалось прочитать файл.'));
+        reader.readAsDataURL(file);
+    });
+}
+
+function applyProductImageDataUrl(productId, dataUrl) {
+    if (!productId || typeof dataUrl !== 'string') {
+        return;
+    }
+
+    const targetId = String(productId);
+    const productIndex = state.items.products.findIndex((product) => String(product.id) === targetId);
+    if (productIndex === -1) {
+        setMessage('Товар не найден. Обновление изображения невозможно.');
+        return;
+    }
+
+    const undoSnapshot = prepareUndoSnapshot();
+    const updatedProducts = [...state.items.products];
+    updatedProducts[productIndex] = {
+        ...updatedProducts[productIndex],
+        image: dataUrl,
+    };
+    state.items.products = updatedProducts;
+
+    const storedItem = state.items[targetId] && typeof state.items[targetId] === 'object'
+        ? { ...state.items[targetId] }
+        : {};
+    storedItem.img = dataUrl;
+    state.items[targetId] = storedItem;
+
+    if (undoSnapshot) {
+        commitUndoSnapshot(undoSnapshot);
+    }
+
+    scheduleStateSave();
+    setMessage('Фото товара обновлено. Размер сохранённого состояния увеличится из-за хранения dataURL.');
+}
+
+async function handleProductImageReplace(event, productId) {
+    if (event && typeof event.stopPropagation === 'function') {
+        event.stopPropagation();
+    }
+
+    const input = event?.target;
+    if (!input || !productId) return;
+
+    const file = input.files && input.files[0];
+    input.value = '';
+    if (!file) return;
+
+    if (file.type && !file.type.startsWith('image/')) {
+        setMessage('Пожалуйста, выберите файл изображения.');
+        return;
+    }
+
+    try {
+        const dataUrl = await readFileAsDataUrl(file);
+        if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image')) {
+            setMessage('Не удалось получить dataURL изображения.');
+            return;
+        }
+        applyProductImageDataUrl(productId, dataUrl);
+    } catch (error) {
+        console.error('[EDITOR:IMAGE]', error);
+        setMessage('Не удалось загрузить изображение. Попробуйте другой файл.');
+    }
 }
 
 // --- Функции Корзины ---
 function updateCartItemQuantity(productId, change) {
-    const product = appState.products.find(p => String(p.id) === String(productId));
+    const product = state.items.products.find(p => String(p.id) === String(productId));
     if (!product) { setMessage('Продукт не найден.'); return; }
     if (!product.hasPrice) { setMessage('Для этого товара требуется запрос цены.'); return; }
-    const newCartItems = { ...appState.cartItems };
+    const newCartItems = { ...state.items.cartItems };
     const newQuantity = (newCartItems[productId]?.quantity || 0) + change;
     if (newQuantity <= 0) delete newCartItems[productId];
     else newCartItems[productId] = { ...product, quantity: newQuantity };
     setState({ cartItems: newCartItems });
 }
 function addToCart(productId) {
-    const product = appState.products.find(p => String(p.id) === String(productId));
+    const product = state.items.products.find(p => String(p.id) === String(productId));
     if (!product) { setMessage('Продукт не найден.'); return; }
     if (!product.hasPrice) { setMessage('Для этого товара требуется запрос цены.'); return; }
     updateCartItemQuantity(productId, 1);
     setMessage("Товар добавлен в корзину!");
 }
 function removeFromCart(productId) {
-    const newCartItems = { ...appState.cartItems };
+    const newCartItems = { ...state.items.cartItems };
     delete newCartItems[productId];
     setState({ cartItems: newCartItems });
 }
 
 function requestPrice(productId) {
-    const product = appState.products.find(p => String(p.id) === String(productId));
+    const product = state.items.products.find(p => String(p.id) === String(productId));
     if (!product) { setMessage('Продукт не найден.'); return; }
     setMessage(`Запрос по товару "${product.name}" отправлен. Менеджер свяжется с вами.`);
 }
@@ -1397,7 +2627,7 @@ async function handleAddProduct(productData) {
         return;
     }
     const [newProduct] = normalized;
-    setState({ products: [...appState.products, newProduct] }, () => setMessage(`Продукт "${newProduct.name}" добавлен.`));
+    setState({ products: [...state.items.products, newProduct] }, () => setMessage(`Продукт "${newProduct.name}" добавлен.`));
 }
 
 function handleFileChange(file) {
@@ -1427,7 +2657,7 @@ function handleBulkImport(jsonString) {
             setMessage('Ни один товар не прошёл нормализацию.');
             return;
         }
-        setState({ products: [...appState.products, ...normalized] });
+        setState({ products: [...state.items.products, ...normalized] });
         setMessage(`Импортировано ${normalized.length} продуктов.`);
     } catch (e) { setMessage(`Ошибка импорта: ${e.message}`); }
 }
@@ -1436,22 +2666,78 @@ function handleBulkImport(jsonString) {
 function findCategoryBySlug(slug) {
     if (!slug) return null;
     const normalizedSlug = String(slug).trim().toLowerCase();
-    return appState.catalogCategories.find(cat => String(cat.slug || '').toLowerCase() === normalizedSlug) || null;
+    return state.groups.catalogCategories.find(cat => String(cat.slug || '').toLowerCase() === normalizedSlug) || null;
 }
 
 function findSubcategoryBySlug(subcategorySlug, categorySlug = null) {
     if (!subcategorySlug) return null;
     const normalizedSub = String(subcategorySlug).trim().toLowerCase();
     const normalizedCategory = categorySlug ? String(categorySlug).trim().toLowerCase() : null;
-    for (const category of appState.catalogCategories) {
+    for (const category of state.groups.catalogCategories) {
         if (normalizedCategory && String(category.slug || '').toLowerCase() !== normalizedCategory) continue;
-        const subcategories = getCategorySubcategories(category);
+        const subcategories = getOrderedSubcategories(category);
         const subcategory = subcategories.find(sub => String(sub.slug || '').toLowerCase() === normalizedSub);
         if (subcategory) {
             return { category, subcategory };
         }
     }
     return null;
+}
+
+function getOrderedCategories() {
+    ensureLayoutOrdering();
+    const categories = Array.isArray(state.groups.catalogCategories) ? state.groups.catalogCategories : [];
+    const order = Array.isArray(state.layout?.groupsOrder) ? state.layout.groupsOrder : [];
+    const map = new Map();
+    categories.forEach((category) => {
+        const slug = String(category?.slug || '').trim();
+        if (slug) {
+            map.set(slug, category);
+        }
+    });
+    const ordered = [];
+    order.forEach((slug) => {
+        const normalizedSlug = String(slug || '').trim();
+        if (!normalizedSlug) return;
+        const category = map.get(normalizedSlug);
+        if (category) {
+            ordered.push(category);
+            map.delete(normalizedSlug);
+        }
+    });
+    map.forEach((category) => ordered.push(category));
+    return ordered;
+}
+
+function getOrderedSubcategories(category) {
+    const subcategories = getCategorySubcategories(category);
+    const groupSlug = String(category?.slug || '').trim();
+    if (!groupSlug) return subcategories;
+    const savedOrder = state.layout?.itemsOrderByGroup && Array.isArray(state.layout.itemsOrderByGroup[groupSlug])
+        ? state.layout.itemsOrderByGroup[groupSlug]
+        : [];
+    if (!savedOrder.length) {
+        return subcategories;
+    }
+    const map = new Map();
+    subcategories.forEach((subcategory) => {
+        const slug = String(subcategory?.slug || '').trim();
+        if (slug) {
+            map.set(slug, subcategory);
+        }
+    });
+    const ordered = [];
+    savedOrder.forEach((slug) => {
+        const normalizedSlug = String(slug || '').trim();
+        if (!normalizedSlug) return;
+        const subcategory = map.get(normalizedSlug);
+        if (subcategory) {
+            ordered.push(subcategory);
+            map.delete(normalizedSlug);
+        }
+    });
+    map.forEach((subcategory) => ordered.push(subcategory));
+    return ordered;
 }
 
 function getCategorySubcategories(category) {
@@ -1483,7 +2769,7 @@ function getSubcategoryKeywords(subcategory, category) {
 
 function getCategoryKeywords(category) {
     if (!category) return [];
-    const subcategories = getCategorySubcategories(category);
+    const subcategories = getOrderedSubcategories(category);
     const keywordSources = [
         category.title,
         ...(Array.isArray(category.keywords) ? category.keywords : []),
@@ -1500,7 +2786,7 @@ function getProductsForCategory(category) {
     const keywords = getCategoryKeywords(category);
     if (!keywords.length) return [];
     const seenIds = new Set();
-    const matched = appState.products.filter(product => {
+    const matched = state.items.products.filter(product => {
         const productId = String(product.id || '');
         if (seenIds.has(productId)) return false;
         const productCategory = String(product.category || '').toLowerCase().replace(/\\+/g, ' ');
@@ -1512,7 +2798,7 @@ function getProductsForCategory(category) {
         }
         return false;
     });
-    return appState.onlyWithPrice ? matched.filter(product => product.hasPrice) : matched;
+    return state.meta.onlyWithPrice ? matched.filter(product => product.hasPrice) : matched;
 }
 
 function getProductsForSubcategory(subcategory, category = null, { respectPriceFilter = true } = {}) {
@@ -1520,7 +2806,7 @@ function getProductsForSubcategory(subcategory, category = null, { respectPriceF
     const keywords = getSubcategoryKeywords(subcategory, category);
     if (!keywords.length) return [];
     const seenIds = new Set();
-    const matched = appState.products.filter(product => {
+    const matched = state.items.products.filter(product => {
         const productId = String(product.id || '');
         if (seenIds.has(productId)) return false;
         const productCategory = String(product.category || '').toLowerCase().replace(/\\+/g, ' ');
@@ -1532,7 +2818,7 @@ function getProductsForSubcategory(subcategory, category = null, { respectPriceF
         }
         return false;
     });
-    if (respectPriceFilter && appState.onlyWithPrice) {
+    if (respectPriceFilter && state.meta.onlyWithPrice) {
         return matched.filter(product => product.hasPrice);
     }
     return matched;
@@ -1550,20 +2836,32 @@ function renderSubcategoryPreview(category, subcategory) {
                 return `<li><a href="${productHash}" onclick="event.preventDefault(); showDetails('${product.id}')" class="hover:text-yellow-600">${escapeHtml(product.name)}</a></li>`;
             }).join('')}</ul>`
         : `<p class="mt-1 text-xs text-gray-400">Товары скоро появятся</p>`;
-    return `<li class="pb-2 border-b border-gray-100 last:border-b-0 last:pb-0"><a href="${hash}" onclick="event.preventDefault(); handleSubcategoryClick('${category.slug}', '${subcategory.slug}')" class="text-sm font-medium text-gray-700 hover:text-[#fcc521]">${escapeHtml(subcategory.title)}</a>${productsList}</li>`;
+    const itemSlug = escapeHtmlAttribute(subcategory.slug);
+    return `
+        <li class="pb-2 border-b border-gray-100 last:border-b-0 last:pb-0 flex items-start gap-2" data-item-id="${itemSlug}">
+            <button type="button" class="editor-only js-drag text-gray-400 hover:text-gray-600 mt-1" aria-label="Переместить подкатегорию">
+                <i class="fas fa-grip-vertical"></i>
+            </button>
+            <div class="flex-1">
+                <a href="${hash}" onclick="event.preventDefault(); handleSubcategoryClick('${category.slug}', '${subcategory.slug}')" class="text-sm font-medium text-gray-700 hover:text-[#fcc521]">${escapeHtml(subcategory.title)}</a>
+                ${productsList}
+            </div>
+        </li>
+    `;
 }
 
 function renderCatalogDropdown() {
+    const categories = getOrderedCategories();
     return `
         <div onmouseenter="setCatalogMenu(true)" onmouseleave="setCatalogMenu(false)" class="absolute top-full left-0 w-max max-w-7xl bg-white text-gray-700 shadow-2xl rounded-b-lg p-8 grid grid-cols-4 gap-x-12 gap-y-6 z-50">
-            ${appState.catalogCategories.map(cat => `
+            ${categories.map(cat => `
                 <div class="space-y-3">
                     <h3 class="font-bold text-md flex items-center gap-3 cursor-pointer" onclick="handleCategoryClick('${cat.slug}')">
                         <i class="fas ${cat.icon} text-[#fcc521] w-5 text-center"></i>
                         <span>${escapeHtml(cat.title)}</span>
                     </h3>
                     <ul class="space-y-2 text-sm">
-                        ${getCategorySubcategories(cat).map(sub => {
+                        ${getOrderedSubcategories(cat).map(sub => {
                             const hash = buildSubcategoryHash(cat.slug, sub.slug);
                             return `<li><a href="${hash}" onclick="event.preventDefault(); handleSubcategoryClick('${cat.slug}', '${sub.slug}')" class="hover:text-[#fcc521] hover:underline">${escapeHtml(sub.title)}</a></li>`;
                         }).join('')}
@@ -1587,7 +2885,7 @@ function renderCategoryPage(slug) {
     const homeHash = getHashForView('home');
     const products = getProductsForCategory(category);
     const productCountLabel = formatProductCount(products.length);
-    const subcategories = getCategorySubcategories(category);
+    const subcategories = getOrderedSubcategories(category);
     const subcategoryChipsHtml = subcategories
         .map(sub => {
             const totalProducts = getProductsForSubcategory(sub, category, { respectPriceFilter: false }).length;
@@ -1634,9 +2932,9 @@ function renderCategoryPage(slug) {
                         <h2 class="text-2xl font-bold text-gray-800">Товары категории</h2>
                         <p class="text-sm text-gray-500">${productCountLabel}</p>
                     </div>
-                    <button onclick="setOnlyWithPrice(!appState.onlyWithPrice)" class="self-start md:self-auto inline-flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-md text-sm text-gray-700 hover:border-yellow-400 hover:text-yellow-600 transition-colors">
+                    <button onclick="setOnlyWithPrice(!state.meta.onlyWithPrice)" class="self-start md:self-auto inline-flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-md text-sm text-gray-700 hover:border-yellow-400 hover:text-yellow-600 transition-colors">
                         <i class="fas fa-ruble-sign"></i>
-                        <span>${appState.onlyWithPrice ? 'Показать все предложения' : 'Только товары с ценой'}</span>
+                        <span>${state.meta.onlyWithPrice ? 'Показать все предложения' : 'Только товары с ценой'}</span>
                     </button>
                 </div>
                 <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-6">
@@ -1667,7 +2965,7 @@ function renderSubcategoryPage(subcategorySlug, categorySlug) {
         ? products.map(renderProductCard).join('')
         : `<p class="col-span-full text-center text-gray-500 py-10">Для подкатегории пока нет опубликованных товаров. Свяжитесь с нашим менеджером для индивидуального предложения.</p>`;
 
-    const siblingSubcategories = getCategorySubcategories(category);
+    const siblingSubcategories = getOrderedSubcategories(category);
     const siblingListHtml = siblingSubcategories
         .map(sub => {
             const isActive = String(sub.slug) === String(subcategory.slug);
@@ -1730,9 +3028,9 @@ function renderSubcategoryPage(subcategorySlug, categorySlug) {
                         <h2 class="text-2xl font-bold text-gray-800">Товары подкатегории</h2>
                         <p class="text-sm text-gray-500">${productCountLabel}</p>
                     </div>
-                    <button onclick="setOnlyWithPrice(!appState.onlyWithPrice)" class="self-start md:self-auto inline-flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-md text-sm text-gray-700 hover:border-yellow-400 hover:text-yellow-600 transition-colors">
+                    <button onclick="setOnlyWithPrice(!state.meta.onlyWithPrice)" class="self-start md:self-auto inline-flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-md text-sm text-gray-700 hover:border-yellow-400 hover:text-yellow-600 transition-colors">
                         <i class="fas fa-ruble-sign"></i>
-                        <span>${appState.onlyWithPrice ? 'Показать все предложения' : 'Только товары с ценой'}</span>
+                        <span>${state.meta.onlyWithPrice ? 'Показать все предложения' : 'Только товары с ценой'}</span>
                     </button>
                 </div>
                 <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-6">
@@ -1752,13 +3050,15 @@ function renderHeader() {
                     <div class="flex items-center gap-6">
                         <div class="flex items-center gap-2 cursor-pointer hover:text-[#fcc521]">
                             <i class="fas fa-map-marker-alt"></i>
-                            <span>Ваш город: <strong>Москва</strong> <i class="fas fa-chevron-down text-xs"></i></span>
+                            <span class="js-editable">Ваш город:</span>
+                            <strong class="js-editable">Москва</strong>
+                            <i class="fas fa-chevron-down text-xs"></i>
                         </div>
                     </div>
                     <div class="flex items-center gap-6">
-                         <a href="#" class="hover:text-[#fcc521]"><i class="fas fa-phone-alt mr-1"></i> <strong>8 (800) 201-85-86</strong></a>
-                         <a href="#" class="hidden lg:inline hover:text-[#fcc521]">Заказать звонок</a>
-                         <a href="#" class="hidden md:inline hover:text-[#fcc521]"><i class="fas fa-user mr-1"></i> Войти</a>
+                         <a href="#" class="hover:text-[#fcc521]"><i class="fas fa-phone-alt mr-1"></i> <strong class="js-editable">8 (800) 201-85-86</strong></a>
+                         <a href="#" class="hidden lg:inline hover:text-[#fcc521]"><span class="js-editable">Заказать звонок</span></a>
+                         <a href="#" class="hidden md:inline hover:text-[#fcc521]"><i class="fas fa-user mr-1"></i> <span class="js-editable">Войти</span></a>
                     </div>
                 </div>
             </div>
@@ -1773,7 +3073,7 @@ function renderHeader() {
 
                     <!-- Search Bar -->
                     <div class="hidden lg:flex flex-grow max-w-lg mx-4">
-                        <input type="text" placeholder="Поиск" oninput="handleSearch(this.value)" value="${appState.searchTerm}" class="w-full border border-gray-300 px-4 py-2 focus:ring-2 focus:ring-[#fcc521] focus:outline-none"/>
+                        <input type="text" placeholder="Поиск" oninput="handleSearch(this.value)" value="${state.meta.searchTerm}" class="w-full border border-gray-300 px-4 py-2 focus:ring-2 focus:ring-[#fcc521] focus:outline-none"/>
                         <button onclick="handleSearch(document.querySelector('input[placeholder=\\'Поиск\\']').value)" class="bg-[#fcc521] text-gray-800 font-bold px-4 hover:bg-yellow-500">
                             <i class="fas fa-search"></i>
                         </button>
@@ -1799,16 +3099,27 @@ function renderHeader() {
                 <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
                      <div class="hidden lg:flex items-center gap-8 h-12">
                         <div class="relative h-full" onmouseenter="setCatalogMenu(true)" onmouseleave="setCatalogMenu(false)">
-                            <button onclick="setView('catalog')" class="hover:bg-gray-700 h-full px-3 transition-colors flex items-center cursor-pointer">
-                                <i class="fas fa-bars mr-2"></i> Каталог
+                            <button onclick="setView('catalog')" class="hover:bg-gray-700 h-full px-3 transition-colors flex items-center cursor-pointer gap-2">
+                                <i class="fas fa-bars"></i>
+                                <span class="js-editable">Каталог</span>
                             </button>
-                            ${appState.isCatalogMenuOpen ? renderCatalogDropdown() : ''}
+                            ${state.layout.isCatalogMenuOpen ? renderCatalogDropdown() : ''}
                         </div>
-                        <button onclick="setView('online-calc')" class="hover:bg-gray-700 h-full px-3 flex items-center transition-colors">Онлайн-расчеты</button>
-                        <button onclick="setView('payment')" class="hover:bg-gray-700 h-full px-3 flex items-center transition-colors">Оплата</button>
-                        <button onclick="setView('delivery')" class="hover:bg-gray-700 h-full px-3 flex items-center transition-colors">Доставка</button>
-                        <button onclick="setView('about')" class="hover:bg-gray-700 h-full px-3 flex items-center transition-colors">О компании</button>
-                        <button onclick="setView('contacts')" class="hover:bg-gray-700 h-full px-3 flex items-center transition-colors">Контакты</button>
+                        <button onclick="setView('online-calc')" class="hover:bg-gray-700 h-full px-3 flex items-center transition-colors">
+                            <span class="js-editable">Онлайн-расчеты</span>
+                        </button>
+                        <button onclick="setView('payment')" class="hover:bg-gray-700 h-full px-3 flex items-center transition-colors">
+                            <span class="js-editable">Оплата</span>
+                        </button>
+                        <button onclick="setView('delivery')" class="hover:bg-gray-700 h-full px-3 flex items-center transition-colors">
+                            <span class="js-editable">Доставка</span>
+                        </button>
+                        <button onclick="setView('about')" class="hover:bg-gray-700 h-full px-3 flex items-center transition-colors">
+                            <span class="js-editable">О компании</span>
+                        </button>
+                        <button onclick="setView('contacts')" class="hover:bg-gray-700 h-full px-3 flex items-center transition-colors">
+                            <span class="js-editable">Контакты</span>
+                        </button>
                      </div>
                 </div>
             </nav>
@@ -1817,7 +3128,7 @@ function renderHeader() {
 }
 
 function renderHomeView() {
-    const slide = appState.slides[appState.activeSlide];
+    const slide = state.layout.slides[state.layout.activeSlide];
     const infoItems = [
         { icon: 'fa-shield-alt', title: 'Широкий ассортимент', text: 'Ведущие поставщики строительных материалов' },
         { icon: 'fa-warehouse', title: '13 000 м² складских помещений', text: 'Большое количество товара в наличии и под заказ' },
@@ -1829,13 +3140,15 @@ function renderHomeView() {
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
             <!-- Hero Slider -->
             <div class="relative w-full overflow-hidden my-8" onmouseenter="stopSlider()" onmouseleave="startSlider()">
-                <div class="flex transition-transform duration-700 ease-in-out" style="transform: translateX(-${appState.activeSlide * 100}%)">
-                    ${appState.slides.map(s => `
+                <div class="flex transition-transform duration-700 ease-in-out" style="transform: translateX(-${state.layout.activeSlide * 100}%)">
+                    ${state.layout.slides.map(s => `
                         <div class="w-full flex-shrink-0">
                             <div class="relative w-full h-[450px]">
                                 <img src="${s.image}" class="w-full h-full object-cover rounded-lg" alt="Слайд карусели"/>
                                 <div class="absolute inset-0 flex justify-center items-end pb-12 rounded-lg">
-                                    <button class="bg-[#fcc521] text-gray-800 font-bold py-3 px-8 hover:bg-yellow-400 transition-colors text-lg rounded-md">Узнать больше</button>
+                                    <button class="bg-[#fcc521] text-gray-800 font-bold py-3 px-8 hover:bg-yellow-400 transition-colors text-lg rounded-md">
+                                        <span class="js-editable">Узнать больше</span>
+                                    </button>
                                 </div>
                             </div>
                         </div>
@@ -1844,8 +3157,8 @@ function renderHomeView() {
 
                 <!-- Slider Dots -->
                 <div class="absolute bottom-4 left-1/2 -translate-x-1/2 flex space-x-2">
-                    ${appState.slides.map((_, index) => `
-                        <button onclick="setActiveSlide(${index})" class="w-3 h-3 rounded-full ${appState.activeSlide === index ? 'bg-white' : 'bg-white/50'}"></button>
+                    ${state.layout.slides.map((_, index) => `
+                        <button onclick="setActiveSlide(${index})" class="w-3 h-3 rounded-full ${state.layout.activeSlide === index ? 'bg-white' : 'bg-white/50'}"></button>
                     `).join('')}
                 </div>
             </div>
@@ -1855,13 +3168,13 @@ function renderHomeView() {
         <div class="bg-white">
             <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-8 py-10">
                 ${infoItems.map(item => `
-                    <div class="flex items-center gap-4">
-                        <i class="fas ${item.icon} text-3xl text-[#fcc521]"></i>
-                        <div>
-                            <h4 class="font-bold text-gray-800">${item.title}</h4>
-                            <p class="text-sm text-gray-500">${item.text}</p>
+                        <div class="flex items-center gap-4">
+                            <i class="fas ${item.icon} text-3xl text-[#fcc521]"></i>
+                            <div>
+                                <h4 class="js-editable font-bold text-gray-800">${item.title}</h4>
+                                <p class="js-editable text-sm text-gray-500">${item.text}</p>
+                            </div>
                         </div>
-                    </div>
                 `).join('')}
             </div>
         </div>
@@ -1870,15 +3183,15 @@ function renderHomeView() {
         <div class="bg-gray-100 py-10">
             <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 grid grid-cols-1 md:grid-cols-3 gap-8">
                  <div class="bg-yellow-400 p-6 rounded-lg text-gray-800 cursor-pointer hover:shadow-xl transition-shadow">
-                    <h3 class="text-xl font-bold">КОРПОРАТИВНЫМ КЛИЕНТАМ</h3>
-                    <p class="text-3xl font-extrabold">СПЕЦИАЛЬНЫЕ УСЛОВИЯ</p>
+                    <h3 class="js-editable text-xl font-bold">КОРПОРАТИВНЫМ КЛИЕНТАМ</h3>
+                    <p class="js-editable text-3xl font-extrabold">СПЕЦИАЛЬНЫЕ УСЛОВИЯ</p>
                  </div>
                  <div class="bg-yellow-400 p-6 rounded-lg text-gray-800 cursor-pointer hover:shadow-xl transition-shadow">
-                     <h3 class="text-xl font-bold"><i class="fas fa-arrow-down"></i> СКИДКА 3%</h3>
-                     <p>на следующий заказ: оформи заказ прямо сейчас на сайте и получи скидку на следующий заказ</p>
+                     <h3 class="js-editable text-xl font-bold"><i class="fas fa-arrow-down"></i> СКИДКА 3%</h3>
+                     <p class="js-editable">на следующий заказ: оформи заказ прямо сейчас на сайте и получи скидку на следующий заказ</p>
                  </div>
                  <div class="bg-yellow-400 p-6 rounded-lg text-gray-800 cursor-pointer hover:shadow-xl transition-shadow">
-                     <h3 class="text-xl font-bold">СКИДКИ ДЛЯ ВСЕХ</h3>
+                     <h3 class="js-editable text-xl font-bold">СКИДКИ ДЛЯ ВСЕХ</h3>
                  </div>
             </div>
         </div>
@@ -1893,8 +3206,8 @@ function renderAboutPage() {
     ];
     
     const content = `
-        <p class="text-lg text-gray-600 mb-8">Принимая решение о покупке в интернет-магазине мы часто задаем себе вопрос, а что скрывается за красочной интернет-витриной? Надежна ли организация у которой мы хотим совершить покупку? Можем ли мы рассчитывать на качественный товар и высокий уровень сервиса которые обещает нам продавец?</p>
-        <p class="text-lg text-gray-600 mb-12">В этом разделе Вы найдете информацию, которая позволит сформировать первое впечатление о холдинге компаний "АРТ-СТРОЙ", ответит на вопросы которые мы сформулировали ранее, поможет принять решение о сотрудничестве с нами.</p>
+        <p class="js-editable text-lg text-gray-600 mb-8">Принимая решение о покупке в интернет-магазине мы часто задаем себе вопрос, а что скрывается за красочной интернет-витриной? Надежна ли организация у которой мы хотим совершить покупку? Можем ли мы рассчитывать на качественный товар и высокий уровень сервиса которые обещает нам продавец?</p>
+        <p class="js-editable text-lg text-gray-600 mb-12">В этом разделе Вы найдете информацию, которая позволит сформировать первое впечатление о холдинге компаний "АРТ-СТРОЙ", ответит на вопросы которые мы сформулировали ранее, поможет принять решение о сотрудничестве с нами.</p>
 
         <h2 class="text-3xl font-bold text-gray-800 mb-8 border-b pb-4">Холдинг "АРТ-СТРОЙ" в цифрах</h2>
         <div class="grid grid-cols-1 md:grid-cols-3 gap-8 mb-12">
@@ -1908,7 +3221,7 @@ function renderAboutPage() {
         </div>
 
         <h2 class="text-3xl font-bold text-gray-800 mb-8 border-b pb-4">Наши партнеры</h2>
-        <p class="text-lg text-gray-600 mb-8">Холдинг компаний "АРТ-СТРОЙ" осуществляет деятельность на рынке строительных материалов с 2002 года. За это время нами были налажены партнерские отношения с ведущими поставщиками, мы являемся дилерами высшей категории многих производителей.</p>
+        <p class="js-editable text-lg text-gray-600 mb-8">Холдинг компаний "АРТ-СТРОЙ" осуществляет деятельность на рынке строительных материалов с 2002 года. За это время нами были налажены партнерские отношения с ведущими поставщиками, мы являемся дилерами высшей категории многих производителей.</p>
         <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-8 items-center mb-12">
             <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/a/a2/TechnoNicol_logo.svg/1200px-TechnoNicol_logo.svg.png" alt="Технониколь" class="h-12 mx-auto grayscale hover:grayscale-0 transition-all"/>
             <img src="https://www.penoplex.ru/images/logo-site.svg" alt="Пеноплэкс" class="h-16 mx-auto grayscale hover:grayscale-0 transition-all"/>
@@ -1932,7 +3245,7 @@ function renderAboutPage() {
 
 function renderDeliveryPage() {
     const content = `
-        <p class="text-lg text-gray-600 mb-8">Интернет-магазин предлагает несколько вариантов доставки:</p>
+        <p class="js-editable text-lg text-gray-600 mb-8">Интернет-магазин предлагает несколько вариантов доставки:</p>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
             <div class="bg-gray-50 p-6 rounded-lg border">
                 <img src="https://i.imgur.com/z7v9g8b.jpeg" alt="Доставка транспортом компании" class="w-full h-48 object-cover rounded-md mb-4"/>
@@ -1992,7 +3305,7 @@ function renderDeliveryPage() {
 
 function renderPaymentPage() {
     const content = `
-        <p class="text-lg text-gray-600 mb-8">При оформлении заказа на нашем сайте, Вы можете выбрать один из следующих вариантов оплаты:</p>
+        <p class="js-editable text-lg text-gray-600 mb-8">При оформлении заказа на нашем сайте, Вы можете выбрать один из следующих вариантов оплаты:</p>
         <div class="space-y-10">
             <div class="bg-gray-50 p-6 rounded-lg border flex flex-col md:flex-row gap-6 items-start">
                 <div class="text-4xl text-[#fcc521] pt-1"><i class="fas fa-money-bill-wave"></i></div>
@@ -2101,7 +3414,7 @@ function renderCheckoutPage(isUpdate = false) {
     }
 
     const totalCost = calculateTotalCost();
-    const { customerType, deliveryMethod, paymentMethod } = appState.checkoutState;
+    const { customerType, deliveryMethod, paymentMethod } = state.meta.checkoutState;
 
     const pageHtml = `
          <h1 class="text-4xl font-bold text-gray-800 mb-6">Оформление заказа</h1>
@@ -2209,6 +3522,9 @@ function renderCheckoutPage(isUpdate = false) {
 
     if (isUpdate && checkoutContent) {
         checkoutContent.innerHTML = pageHtml;
+        if (window.editorMode) {
+            window.editorMode.refresh();
+        }
     } else {
         return `<div id="checkout-content" class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10">${pageHtml}</div>`;
     }
@@ -2220,7 +3536,7 @@ function renderStaticPage(title, content) {
     return `
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
             <div class="bg-white p-8 rounded-lg shadow-md">
-                <h1 class="text-4xl font-bold text-gray-800 mb-6">${title}</h1>
+                <h1 class="js-editable text-4xl font-bold text-gray-800 mb-6">${title}</h1>
                 <div class="prose max-w-none">${content}</div>
             </div>
         </div>
@@ -2229,13 +3545,14 @@ function renderStaticPage(title, content) {
 
 
 function renderCatalogPage() {
+    const categories = getOrderedCategories();
     const content = `
     <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
         <h1 class="text-4xl font-bold text-gray-800 mb-6">Каталог</h1>
         <div class="grid grid-cols-1 md:grid-cols-4 gap-8">
             <aside class="md:col-span-1">
                 <ul class="space-y-2 bg-white p-4 rounded-lg shadow-md">
-                    ${appState.catalogCategories.map(cat => `
+                    ${categories.map(cat => `
                         <li>
                             <a href="#" onclick="event.preventDefault(); handleCategoryClick('${cat.slug}')" class="flex items-center p-2 text-gray-700 rounded-lg hover:bg-gray-100 hover:text-[#fcc521]">
                                 <i class="fas ${cat.icon} w-6 text-center"></i>
@@ -2246,26 +3563,28 @@ function renderCatalogPage() {
                 </ul>
             </aside>
             <main class="md:col-span-3">
-                 <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
-                    ${appState.catalogCategories.map(cat => `
-                        <div class="bg-white p-4 rounded-lg shadow-md flex gap-4">
-                            <img src="${cat.image}" alt="${escapeHtml(cat.title)}" class="w-24 h-24 object-cover rounded-md"/>
-                            <div>
-                                <h3 class="font-bold text-lg cursor-pointer" onclick="handleCategoryClick('${cat.slug}')">${escapeHtml(cat.title)}</h3>
-                                <ul class="text-sm mt-2 space-y-2">
-                                    ${(() => {
-                                        const subcategories = getCategorySubcategories(cat);
-                                        const preview = subcategories.slice(0, 5).map(sub => renderSubcategoryPreview(cat, sub)).join('');
-                                        const moreLink = subcategories.length > 5
-                                            ? `<li class="pt-2"><a href="${buildCategoryHash(cat.slug)}" onclick="event.preventDefault(); handleCategoryClick('${cat.slug}')" class="text-xs font-semibold text-yellow-600 hover:underline">Все подкатегории...</a></li>`
-                                            : '';
-                                        const baseContent = preview || '<li class="text-xs text-gray-400">Подкатегории в разработке</li>';
-                                        return baseContent + moreLink;
-                                    })()}
-                                </ul>
+                 <div class="grid grid-cols-1 lg:grid-cols-2 gap-8" data-groups-container="catalog">
+                    ${categories.map(cat => {
+                        const orderedSubcategories = getOrderedSubcategories(cat);
+                        const hasSubcategories = orderedSubcategories.length > 0;
+                        const subcategoriesHtml = hasSubcategories
+                            ? orderedSubcategories.map(sub => renderSubcategoryPreview(cat, sub)).join('')
+                            : '<li class="text-xs text-gray-400">Подкатегории в разработке</li>';
+                        return `
+                            <div class="bg-white p-4 rounded-lg shadow-md flex gap-4 relative" data-group-id="${escapeHtmlAttribute(cat.slug)}">
+                                <button type="button" class="editor-only js-drag text-gray-400 hover:text-gray-600 absolute top-3 right-3" aria-label="Переместить категорию">
+                                    <i class="fas fa-grip-vertical"></i>
+                                </button>
+                                <img src="${cat.image}" alt="${escapeHtml(cat.title)}" class="w-24 h-24 object-cover rounded-md"/>
+                                <div class="pr-6">
+                                    <h3 class="font-bold text-lg cursor-pointer" onclick="handleCategoryClick('${cat.slug}')">${escapeHtml(cat.title)}</h3>
+                                    <ul class="text-sm mt-2 space-y-2" data-items-container="${escapeHtmlAttribute(cat.slug)}">
+                                        ${subcategoriesHtml}
+                                    </ul>
+                                </div>
                             </div>
-                        </div>
-                    `).join('')}
+                        `;
+                    }).join('')}
                  </div>
             </main>
         </div>
@@ -2300,20 +3619,20 @@ function renderProductList() {
                     <div class="flex-grow"></div>
                     <div class="flex items-center gap-4">
                         <label class="flex items-center gap-2 text-sm text-gray-700 bg-white px-3 py-2 rounded-lg shadow-sm">
-                            <input type="checkbox" ${appState.onlyWithPrice ? 'checked' : ''} onchange="setOnlyWithPrice(this.checked)" class="h-4 w-4 text-[#fcc521] border-gray-300 rounded focus:ring-[#fcc521]"/>
+                            <input type="checkbox" ${state.meta.onlyWithPrice ? 'checked' : ''} onchange="setOnlyWithPrice(this.checked)" class="h-4 w-4 text-[#fcc521] border-gray-300 rounded focus:ring-[#fcc521]"/>
                             <span>Только с ценой</span>
                         </label>
                         <select onchange="setState({ sortBy: this.value })" class="w-full md:w-auto px-4 py-2 border border-gray-300 rounded-lg bg-white focus:ring-2 focus:ring-[#fcc521] focus:outline-none">
-                            <option value="name-asc" ${appState.sortBy === 'name-asc' ? 'selected' : ''}>По названию (А-Я)</option>
-                            <option value="name-desc" ${appState.sortBy === 'name-desc' ? 'selected' : ''}>По названию (Я-А)</option>
-                            <option value="price-asc" ${appState.sortBy === 'price-asc' ? 'selected' : ''}>Сначала дешевле</option>
-                            <option value="price-desc" ${appState.sortBy === 'price-desc' ? 'selected' : ''}>Сначала дороже</option>
+                            <option value="name-asc" ${state.meta.sortBy === 'name-asc' ? 'selected' : ''}>По названию (А-Я)</option>
+                            <option value="name-desc" ${state.meta.sortBy === 'name-desc' ? 'selected' : ''}>По названию (Я-А)</option>
+                            <option value="price-asc" ${state.meta.sortBy === 'price-asc' ? 'selected' : ''}>Сначала дешевле</option>
+                            <option value="price-desc" ${state.meta.sortBy === 'price-desc' ? 'selected' : ''}>Сначала дороже</option>
                         </select>
                     </div>
                 </div>
             </div>
             <div id="product-grid-container" class="grid-container grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-6">
-                ${visibleProducts.length > 0 ? visibleProducts.map(renderProductCard).join('') : `<p class="col-span-full text-center text-gray-500 py-10">Товары не найдены.</p>`}
+                ${visibleProducts.length > 0 ? visibleProducts.map((product, index) => renderProductCard(product, index)).join('') : `<p class="col-span-full text-center text-gray-500 py-10">Товары не найдены.</p>`}
             </div>
         </div>`;
 }
@@ -2321,35 +3640,54 @@ function renderProductList() {
 /**
  * Рендерит карточку товара в списке с учётом цены, бейджей и безопасного изображения.
  */
-function renderProductCard(product) {
-    const itemInCart = appState.cartItems[product.id];
+function renderProductCard(product, index = 0) {
+    const itemInCart = state.items.cartItems[product.id];
     const priceLabel = getProductPriceLabel(product);
     const unitLabel = product.hasPrice ? `<span class="text-sm font-normal text-gray-500"> / ${escapeHtml(product.unit)}</span>` : '';
     const titleAttr = escapeHtmlAttribute(product.name);
     const nameText = escapeHtml(product.name);
     const categoryText = escapeHtml(product.category);
+    const productImage = resolveProductImage(product);
+    const replacePhotoInputId = buildEditorInputId('replace-photo-card', `${product.id}-${index}`);
+    const actionHtml = product.hasPrice
+        ? (!itemInCart
+            ? `<button onclick="addToCart('${product.id}')" class="bg-[#fcc521] hover:bg-yellow-500 text-gray-800 font-bold px-4 py-2 rounded-md transition-colors duration-200">В корзину</button>`
+            : `<div class="flex items-center rounded-lg border border-gray-300">
+                                    <button onclick="updateCartItemQuantity('${product.id}', -1)" class="px-3 py-1 text-lg hover:bg-gray-100 rounded-l-lg">-</button>
+                                    <span class="px-3 font-medium">${itemInCart.quantity}</span>
+                                    <button onclick="updateCartItemQuantity('${product.id}', 1)" class="px-3 py-1 text-lg hover:bg-gray-100 rounded-r-lg">+</button>
+                                </div>`)
+        : `<button onclick="requestPrice('${product.id}')" class="bg-gray-200 hover:bg-gray-300 text-gray-700 font-semibold px-4 py-2 rounded-md transition-colors duration-200">Запросить цену</button>`;
     return `
         <div class="bg-white rounded-lg shadow-md overflow-hidden transform hover:-translate-y-1 transition-transform duration-300 flex flex-col group border">
             <div class="relative h-48 bg-gray-200 cursor-pointer" onclick="showDetails('${product.id}')">
-                <img src="${product.image}" alt="${titleAttr}" class="w-full h-full object-cover" onerror="this.onerror=null; this.src='${PLACEHOLDER_IMAGE}'"/>
+                <img src="${productImage}" alt="${titleAttr}" class="w-full h-full object-cover" onerror="this.onerror=null; this.src='${PLACEHOLDER_IMAGE}'"/>
                 ${product.badges.noPrice ? `<span class="absolute top-3 left-3 bg-amber-500 text-white text-xs font-semibold px-2 py-1 rounded">Цена по запросу</span>` : ''}
             </div>
-            <div class="p-4 flex-grow flex flex-col gap-2">
+            <div class="p-4 flex-grow flex flex-col gap-3">
                 <h3 class="text-md font-semibold text-gray-800 cursor-pointer hover:text-yellow-500" onclick="showDetails('${product.id}')" title="${titleAttr}" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;">
                     ${nameText}
                 </h3>
                 <p class="text-sm text-gray-500">${categoryText}</p>
                 <p class="text-lg font-bold text-gray-900">${priceLabel}${unitLabel}</p>
-                <div class="mt-auto flex items-center justify-between gap-3">
-                    ${product.hasPrice ? (
-                        !itemInCart
-                            ? `<button onclick="addToCart('${product.id}')" class="bg-[#fcc521] hover:bg-yellow-500 text-gray-800 font-bold px-4 py-2 rounded-md transition-colors duration-200">В корзину</button>`
-                            : `<div class="flex items-center rounded-lg border border-gray-300">
-                                    <button onclick="updateCartItemQuantity('${product.id}', -1)" class="px-3 py-1 text-lg hover:bg-gray-100 rounded-l-lg">-</button>
-                                    <span class="px-3 font-medium">${itemInCart.quantity}</span>
-                                    <button onclick="updateCartItemQuantity('${product.id}', 1)" class="px-3 py-1 text-lg hover:bg-gray-100 rounded-r-lg">+</button>
-                                </div>`
-                    ) : `<button onclick="requestPrice('${product.id}')" class="bg-gray-200 hover:bg-gray-300 text-gray-700 font-semibold px-4 py-2 rounded-md transition-colors duration-200">Запросить цену</button>`}
+                <div class="mt-auto flex flex-col gap-3">
+                    ${actionHtml}
+                    <div class="editor-only space-y-2">
+                        <label for="${replacePhotoInputId}" class="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-3 py-2 text-sm font-semibold text-white shadow transition hover:bg-slate-800">
+                            <i class="fas fa-camera-retro text-xs"></i>
+                            <span>Заменить фото</span>
+                        </label>
+                        <input
+                            id="${replacePhotoInputId}"
+                            type="file"
+                            accept="image/*"
+                            class="hidden"
+                            onchange="handleProductImageReplace(event, ${JSON.stringify(product.id)})"
+                        />
+                        <p class="text-xs leading-snug text-amber-600">
+                            Изображение сохраняется в состоянии как dataURL и может значительно увеличить размер сохранения.
+                        </p>
+                    </div>
                 </div>
             </div>
         </div>`;
@@ -2366,7 +3704,7 @@ function renderCartView() {
                     <p class="text-xl text-gray-600 mb-4">Ваша корзина пуста</p>
                     <button onclick="setView('catalog')" class="bg-[#fcc521] hover:bg-yellow-500 text-gray-800 font-bold px-6 py-2 rounded-lg transition">Перейти в каталог</button>
                 </div>` : `
-                <div class="space-y-4">${Object.entries(appState.cartItems).map(([productId, item]) => {
+                <div class="space-y-4">${Object.entries(state.items.cartItems).map(([productId, item]) => {
                     const itemName = escapeHtml(item.name);
                     const itemUnit = escapeHtml(item.unit);
                     return `
@@ -2396,9 +3734,9 @@ function renderCartView() {
  * Отрисовывает карточку товара с безопасным описанием и адаптированными действиями.
  */
 function renderProductDetails() {
-    const product = appState.products.find(p => String(p.id) === String(appState.selectedProductId));
+    const product = state.items.products.find(p => String(p.id) === String(state.layout.selectedProductId));
     if (!product) return `<div class="p-10 text-center text-red-600">Продукт не найден.</div>`;
-    const itemInCart = appState.cartItems[product.id];
+    const itemInCart = state.items.cartItems[product.id];
     const sanitizedDescription = sanitizeHtml(product.descriptionHtml);
     const descriptionBlock = sanitizedDescription
         ? `<div class="prose max-w-none space-y-4 product-description">${sanitizedDescription}</div>`
@@ -2413,6 +3751,8 @@ function renderProductDetails() {
     const titleAttr = escapeHtmlAttribute(product.name);
     const nameText = escapeHtml(product.name);
     const categoryText = escapeHtml(product.category);
+    const productImage = resolveProductImage(product, { fallbackWidth: 800, fallbackHeight: 600 });
+    const detailInputId = buildEditorInputId('replace-photo-detail', product.id);
 
     return `
         <div class="max-w-5xl mx-auto p-4 sm:p-6 bg-white my-8 rounded-lg shadow-xl">
@@ -2420,8 +3760,26 @@ function renderProductDetails() {
                 <i class="fas fa-arrow-left mr-2"></i> Назад в каталог
             </button>
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
-                <div class="bg-gray-100 rounded-lg flex items-center justify-center p-4">
-                    <img src="${product.image}" alt="${titleAttr}" class="max-h-96 w-auto object-contain" onerror="this.onerror=null; this.src='${PLACEHOLDER_IMAGE}'"/>
+                <div class="flex flex-col gap-4">
+                    <div class="bg-gray-100 rounded-lg flex items-center justify-center p-4">
+                        <img src="${productImage}" alt="${titleAttr}" class="max-h-96 w-auto object-contain" onerror="this.onerror=null; this.src='${PLACEHOLDER_IMAGE}'"/>
+                    </div>
+                    <div class="editor-only space-y-2">
+                        <label for="${detailInputId}" class="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-3 py-2 text-sm font-semibold text-white shadow transition hover:bg-slate-800">
+                            <i class="fas fa-camera-retro text-xs"></i>
+                            <span>Заменить фото</span>
+                        </label>
+                        <input
+                            id="${detailInputId}"
+                            type="file"
+                            accept="image/*"
+                            class="hidden"
+                            onchange="handleProductImageReplace(event, ${JSON.stringify(product.id)})"
+                        />
+                        <p class="text-xs leading-snug text-amber-600">
+                            Изображение сохраняется в состоянии как dataURL и может значительно увеличить размер сохранения.
+                        </p>
+                    </div>
                 </div>
                 <div class="space-y-4">
                     <div class="space-y-2">
@@ -2489,12 +3847,12 @@ function renderAdminPanel() {
 }
 
 function renderAdminContent() {
-    if (appState.view === 'admin') setTimeout(renderAdminPanel, 0);
+    if (state.layout.view === 'admin') setTimeout(renderAdminPanel, 0);
 }
 
 function renderMessageModal() {
-    if (!appState.message) return '';
-    const safeMessage = escapeHtml(appState.message);
+    if (!state.meta.message) return '';
+    const safeMessage = escapeHtml(state.meta.message);
     return `<div class="fixed top-5 right-5 bg-gray-800 text-white py-3 px-5 rounded-lg shadow-xl z-50 animate-fade-in-down"><p><i class="fas fa-check-circle mr-2"></i>${safeMessage}</p></div>`;
 }
 
@@ -2503,10 +3861,10 @@ function renderFooter() {
 }
 
 function renderMobileMenu() {
-    if (!appState.isMenuOpen) return '';
+    if (!state.layout.isMenuOpen) return '';
     return `
         <div class="fixed inset-0 bg-black bg-opacity-60 z-[70]" onclick="toggleMenu()">
-            <div class="fixed top-0 left-0 h-full w-72 bg-white shadow-xl p-6 transform transition-transform duration-300 ${appState.isMenuOpen ? 'translate-x-0' : '-translate-x-full'}" onclick="event.stopPropagation()">
+            <div class="fixed top-0 left-0 h-full w-72 bg-white shadow-xl p-6 transform transition-transform duration-300 ${state.layout.isMenuOpen ? 'translate-x-0' : '-translate-x-full'}" onclick="event.stopPropagation()">
                  <button onclick="toggleMenu()" class="absolute top-4 right-4 text-gray-500 hover:text-gray-800"><i class="fas fa-times text-2xl"></i></button>
                  <nav class="flex flex-col space-y-5 mt-10">
                     <button onclick="setView('catalog'); toggleMenu();" class="text-lg text-gray-700 hover:text-[#fcc521] text-left p-2 rounded-md hover:bg-gray-100 flex items-center"><i class="fas fa-bars w-6 mr-3"></i>Каталог</button>
@@ -2527,7 +3885,7 @@ function renderMobileMenu() {
 
 function render() {
     const appContainer = document.getElementById('app');
-    if (appState.view === 'checkout') {
+    if (state.layout.view === 'checkout') {
          // Для страницы оформления заказа мы не хотим полного перерендера
          if (!document.getElementById('checkout-content')) {
             const checkoutHtml = renderCheckoutPage();
@@ -2539,14 +3897,21 @@ function render() {
                 </div>
                 ${renderMobileMenu()}
                 <div id="modal-container">${renderMessageModal()}</div>`;
+            syncEditableContent({ captureMissing: true });
+         } else {
+            syncEditableContent({ captureMissing: true });
          }
-         return; // Предотвращаем полный ререндер
+        if (window.editorMode) {
+            window.editorMode.refresh();
+            refreshCatalogSortables();
+        }
+        return; // Предотвращаем полный ререндер
     }
 
     let contentHtml = '';
-    switch (appState.view) {
-        case 'category': contentHtml = renderCategoryPage(appState.selectedCategorySlug); break;
-        case 'subcategory': contentHtml = renderSubcategoryPage(appState.selectedSubcategorySlug, appState.selectedCategorySlug); break;
+    switch (state.layout.view) {
+        case 'category': contentHtml = renderCategoryPage(state.layout.selectedCategorySlug); break;
+        case 'subcategory': contentHtml = renderSubcategoryPage(state.layout.selectedSubcategorySlug, state.layout.selectedCategorySlug); break;
         case 'catalog': contentHtml = renderProductList(); break;
         case 'cart': contentHtml = renderCartView(); break;
         case 'details': contentHtml = renderProductDetails(); break;
@@ -2567,7 +3932,12 @@ function render() {
         </div>
         ${renderMobileMenu()}
         <div id="modal-container">${renderMessageModal()}</div>`;
-    if (appState.view === 'admin') renderAdminContent();
+    syncEditableContent({ captureMissing: true });
+    if (window.editorMode) {
+        window.editorMode.refresh();
+        refreshCatalogSortables();
+    }
+    if (state.layout.view === 'admin') renderAdminContent();
 }
 
 // --- Инициализация ---
@@ -2580,6 +3950,7 @@ window.requestPrice = requestPrice;
 window.exitProductDetails = exitProductDetails;
 window.handleBulkImport = handleBulkImport;
 window.handleFileChange = handleFileChange;
+window.handleProductImageReplace = handleProductImageReplace;
 window.setState = setState;
 window.toggleMenu = toggleMenu;
 window.setActiveSlide = setActiveSlide;
@@ -2590,16 +3961,29 @@ window.handlePlaceOrder = handlePlaceOrder;
 window.handleCheckoutChange = handleCheckoutChange;
 window.handleSearch = handleSearch;
 window.setOnlyWithPrice = setOnlyWithPrice;
+window.undoStateChange = undoStateChange;
+window.redoStateChange = redoStateChange;
 
-window.onload = () => {
-    loadState();
+async function bootstrapApplication() {
+    await initializeState();
     applyInitialRoute();
     render();
+    if (window.editorMode) {
+        window.editorMode.setup();
+        window.editorMode.refresh();
+        refreshCatalogSortables();
+    }
     window.addEventListener('hashchange', handleHashChange);
-    if (appState.view === 'home') {
+    if (state.layout.view === 'home') {
         startSlider();
     }
-};
+}
+
+window.addEventListener('load', () => {
+    bootstrapApplication().catch((error) => {
+        console.error('[APP:INIT]', error);
+    });
+});
 
 window.onbeforeunload = () => {
     stopSlider();
