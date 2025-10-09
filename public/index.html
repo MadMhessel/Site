@@ -3,7 +3,7 @@
 <head>
     <!-- latch-edit-flag: фикс потерянного edit при раннем переписывании URL/DOM -->
     <script>
-        (function () {
+        (function() {
             "use strict";
             // Истина: edit без значения, или =1/true/on/yes
             function truthy(v) {
@@ -98,13 +98,13 @@
     <div id="app" class="min-h-screen">
         <!-- Содержимое будет сгенерировано JS -->
     </div>
-    <script defer src="./editor.js"></script>
+    <script defer src="/editor.js"></script>
     <!-- Подключаем файл с каталогом -->
-    <script src="./catalog.js"></script>
+    <script src="/catalog.js"></script>
     <!-- Загрузка единого файла логики -->
-    <script src="./app.js"></script>
+    <script src="/app.js"></script>
     <!-- Вспомогательный бутстрап редактора -->
-    <script defer src="./editor-boot.js"></script>
-    <script defer src="./editor-hardlock.js"></script>
+    <script defer src="/editor-boot.js"></script>
+    <script defer src="/editor-hardlock.js"></script>
 </body>
 </html>
