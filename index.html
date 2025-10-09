@@ -11,14 +11,12 @@
                 v = String(v).trim().toLowerCase();
                 return v === "" || v === "1" || v === "true" || v === "on" || v === "yes";
             }
-
             // 1) Ищем edit в location.search
             var sp = new URLSearchParams(location.search);
             if (sp.has("edit") && truthy(sp.get("edit"))) {
                 sessionStorage.setItem("editModeRequested", "1");
                 return;
             }
-
             // 2) Ищем edit в hash-параметрах, напр. "#/route?edit=1"
             var h = location.hash || "";
             var qIndex = h.indexOf("?");
@@ -34,156 +32,27 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>СтройМаркет - Автономный Каталог</title>
-    <!-- Подключение Tailwind CSS CDN -->
+    <!-- Tailwind -->
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Font Awesome -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css">
-    <!-- SortableJS -->
-    <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
-    <style>
-        /* Настройка шрифта и скроллинга */
-        body {
-            font-family: 'Inter', sans-serif;
-            min-height: 100vh;
-            background-color: #f3f4f6;
-        }
-        /* Адаптивное центрирование для карточек */
-        .grid-container {
-            display: grid;
-            gap: 24px;
-            padding: 24px;
-            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-        }
-        /* Стили для типографики на статических страницах */
-        .prose {
-            color: #374151;
-        }
-        .prose h2 {
-            font-size: 1.875rem;
-            font-weight: 700;
-            margin-bottom: 1.5rem;
-            border-bottom: 1px solid #e5e7eb;
-            padding-bottom: 0.5rem;
-        }
-        .prose h3 {
-             font-size: 1.5rem;
-             font-weight: 700;
-             margin-bottom: 1rem;
-        }
-        .prose p, .prose ul, .prose ol {
-            line-height: 1.75;
-            margin-bottom: 1.25rem;
-        }
-         /* Анимация для всплывающих сообщений */
-        @keyframes fade-in-down {
-            from {
-                opacity: 0;
-                transform: translateY(-20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-        .animate-fade-in-down {
-            animation: fade-in-down 0.5s ease-out forwards;
-        }
-        body:not(.editor-mode) .editor-only,
-        body:not(.editor-mode) .js-drag {
-            display: none !important;
-        }
-
-        body.editor-mode .js-drag {
-            cursor: grab;
-        }
-
-        body.editor-mode .js-drag:active {
-            cursor: grabbing;
-        }
-
-        #editor-panel {
-            display: none;
-        }
-
-        #editor-panel button:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-
-        body.editor-mode #editor-panel {
-            display: flex;
-        }
-
-        body.editor-mode .js-editable,
-        body.editor-mode [data-editable] {
-            outline: 1px dashed rgba(37, 99, 235, 0.35);
-            outline-offset: 2px;
-            cursor: text;
-            transition: background-color 0.2s ease-in-out;
-        }
-
-        body.editor-mode .js-editable:hover,
-        body.editor-mode [data-editable]:hover {
-            background-color: rgba(37, 99, 235, 0.04);
-        }
-
-        body.editor-mode .js-editable:focus-visible,
-        body.editor-mode [data-editable]:focus-visible {
-            outline: 2px solid #2563eb;
-            outline-offset: 2px;
-        }
-
-        body.editor-mode [data-group-id] {
-            outline: 1px dashed rgba(107, 114, 128, 0.35);
-            outline-offset: 4px;
-        }
-
-        body.editor-mode [data-item-id] {
-            outline: 1px dashed rgba(148, 163, 184, 0.4);
-            outline-offset: 2px;
-        }
-
-        #editor-toggle:focus-visible,
-        #editor-panel button:focus-visible {
-            outline: 3px solid rgba(37, 99, 235, 0.6);
-            outline-offset: 2px;
-        }
-
-        body:not(.editor-mode) .js-editable:focus,
-        body:not(.editor-mode) [data-editable]:focus {
-            outline: none;
-        }
-    </style>
+    <!-- FontAwesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.7.2/css/all.min.css"
+          integrity="sha512-Evv84Mr4kqVGRNSgIGL/F/aIDqQb7xQ2vcrdIwxfjThSH8CSR7PBEakCr51Ck+w+/U6swU2Im1vVX0SVk9ABhg=="
+          crossorigin="anonymous" referrerpolicy="no-referrer"/>
+    <!-- Sortable.js -->
+    <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.3/Sortable.min.js"></script>
 </head>
-<body>
-
-    <button
-        id="editor-toggle"
-        type="button"
-        class="fixed top-4 right-4 z-50 inline-flex min-h-[44px] min-w-[44px] items-center justify-center gap-2 rounded-md bg-gray-900 px-4 py-2 text-white shadow-lg"
-        aria-controls="editor-panel"
-        aria-label="Переключить режим редактирования"
-        aria-pressed="false"
-        aria-hidden="true"
-        hidden
-    >
-        Редактировать
-    </button>
-
-    <div
-        id="editor-panel"
-        class="fixed top-20 right-4 z-40 flex w-56 flex-col gap-2 rounded-xl border border-gray-200 bg-white p-4 shadow-xl"
-        role="toolbar"
-        aria-hidden="true"
-        aria-label="Панель редактора"
-        style="display: none;"
-    >
-        <div class="flex items-center justify-between text-xs font-semibold text-gray-600">
-            <span>API статус</span>
-            <span class="flex items-center gap-2">
-                <span class="inline-flex h-2.5 w-2.5 rounded-full bg-gray-300" data-editor-health-indicator aria-hidden="true"></span>
-                <span class="text-[11px] font-medium text-gray-500" data-editor-health-text>Не проверено</span>
-            </span>
+<body class="bg-gray-50">
+    <div id="editor-bar" class="hidden" data-editor-active="false">
+        <div class="flex items-center justify-between px-4 py-2 bg-blue-600 text-white shadow-md">
+            <div class="flex items-center gap-2">
+                <i class="fas fa-pencil-alt"></i>
+                <span class="text-sm font-semibold">Режим редактирования</span>
+            </div>
+            <button type="button" data-editor-action="exit"
+                    class="rounded-lg bg-red-500 px-3 py-1 text-sm font-semibold text-white transition hover:bg-red-600"
+                    aria-label="Выйти из режима редактирования">
+                Выйти
+            </button>
         </div>
         <div class="grid grid-cols-2 gap-2">
             <button
@@ -226,20 +95,16 @@
             Импорт заменит текущее состояние. Перед загрузкой сохраните резервную копию.
         </p>
     </div>
-
     <div id="app" class="min-h-screen">
         <!-- Содержимое будет сгенерировано JS -->
     </div>
-
-    <script defer src="editor.js"></script>
+    <script defer src="./editor.js"></script>
     <!-- Подключаем файл с каталогом -->
-    <script src="catalog.js"></script>
+    <script src="./catalog.js"></script>
     <!-- Загрузка единого файла логики -->
-    <script src="app.js"></script>
+    <script src="./app.js"></script>
     <!-- Вспомогательный бутстрап редактора -->
-    <script defer src="editor-boot.js"></script>
-    <script defer src="editor-hardlock.js"></script>
-
+    <script defer src="./editor-boot.js"></script>
+    <script defer src="./editor-hardlock.js"></script>
 </body>
 </html>
-
