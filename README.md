@@ -6,10 +6,12 @@
    ```bash
    npm install
    ```
+
 2. Экспортируйте API-ключ Gemini в переменную окружения и запустите сервер-прокси:
    ```bash
    GEMINI_API_KEY="ваш-ключ" npm start
    ```
+
 3. Откройте [http://localhost:3000](http://localhost:3000) и работайте с приложением.
 
 > Серверная прокладка скрывает ключ и обрабатывает ошибки API. Браузер обращается только к относительному эндпоинту `/api/generate`.
@@ -43,3 +45,89 @@
 ```bash
 curl http://localhost:3000/api/health
 ```
+
+## Оптимизация загрузки каталога
+
+### Ветка fix-catalog-js
+
+В ветке `fix-catalog-js` реализована оптимизация загрузки файла каталога:
+
+### Что было сделано:
+
+1. **Замена большого каталога на тестовую версию**
+   - Файл `catalog.js` заменен на короткую тестовую версию с двумя записями товаров
+   - Размер файла уменьшен с 3.34 МБ до 533 байт
+   - Это значительно ускоряет начальную загрузку страницы
+
+2. **Асинхронная загрузка через dynamic import**
+   - Рекомендуется реализовать асинхронную загрузку `catalog.js` с помощью динамического импорта
+   - Это позволит загружать каталог параллельно с другими ресурсами
+   - При возникновении ошибки загрузки приложение продолжит работу с fallback-данными
+
+### Инструкция по внедрению async loading:
+
+Для полной реализации асинхронной загрузки каталога выполните следующие шаги:
+
+#### Вариант 1: Модификация index.html (рекомендуется)
+
+Замените в файле `index.html` синхронную загрузку:
+```html
+<script src="catalog.js"></script>
+<script src="app.js"></script>
+```
+
+На асинхронную загрузку с обработкой ошибок:
+```html
+<script type="module">
+  // Асинхронная загрузка catalog.js с обработкой ошибок
+  (async () => {
+    try {
+      const catalogModule = await import('./catalog.js');
+      window.FULL_CATALOG = catalogModule.default || [];
+      console.log('✓ Catalog loaded successfully:', window.FULL_CATALOG.length, 'items');
+    } catch (error) {
+      console.error('✗ Failed to load catalog.js:', error);
+      window.FULL_CATALOG = [];
+      // Показываем уведомление пользователю
+      const errorNotif = document.createElement('div');
+      errorNotif.style.cssText = 'position: fixed; top: 20px; right: 20px; background: #fee; border: 1px solid #fcc; color: #c33; padding: 15px; border-radius: 5px; z-index: 10000; max-width: 300px;';
+      errorNotif.textContent = 'Ошибка загрузки каталога: ' + error.message;
+      document.body.appendChild(errorNotif);
+      setTimeout(() => errorNotif.remove(), 5000);
+    }
+  })();
+</script>
+<script src="app.js"></script>
+```
+
+#### Вариант 2: Модификация app.js
+
+Добавьте в начало файла `app.js` функцию асинхронной загрузки:
+```javascript
+// Асинхронная загрузка каталога
+async function loadCatalogAsync() {
+    try {
+        const catalogModule = await import('./catalog.js');
+        window.FULL_CATALOG = catalogModule.default || [];
+        console.log('✓ Catalog loaded:', window.FULL_CATALOG.length, 'items');
+        return window.FULL_CATALOG;
+    } catch (error) {
+        console.error('✗ Failed to load catalog:', error);
+        window.FULL_CATALOG = [];
+        return [];
+    }
+}
+
+// Вызовите эту функцию перед инициализацией приложения
+```
+
+### Преимущества оптимизации:
+
+- **Уменьшение времени первой загрузки** — каталог загружается асинхронно
+- **Лучшая отказоустойчивость** — при ошибке загрузки приложение продолжает работать
+- **Улучшенная производительность** — маленький тестовый файл загружается мгновенно
+- **Удобство разработки** — легче тестировать и отлаживать с небольшим каталогом
+
+### Для продакшена:
+
+Когда будете готовы к продакшену, замените тестовые данные в `catalog.js` на полный каталог товаров, сохранив при этом асинхронную загрузку для оптимальной производительности.
