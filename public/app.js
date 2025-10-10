@@ -1,5 +1,4 @@
 // --- УТИЛИТЫ ---
-
 /**
  * Парсит CSV строку в JSON массив объектов
  * @param {string} csvText - CSV текст для парсинга
@@ -31,6 +30,20 @@ function parseCSVToJSON(csvText) {
     }
     
     return result;
+}
+
+// Асинхронная загрузка каталога
+async function loadCatalogAsync() {
+  try {
+    const catalogModule = await import('./catalog.js');
+    window.FULL_CATALOG = catalogModule.default || [];
+    console.log('✓ Catalog loaded:', window.FULL_CATALOG.length, 'items');
+    return window.FULL_CATALOG;
+  } catch (error) {
+    console.error('✗ Failed to load catalog:', error);
+    window.FULL_CATALOG = [];
+    return [];
+  }
 }
 
 // --- КОНФИГУРАЦИЯ ---
@@ -69,3 +82,14 @@ const CONFIG = {
         maxBackups: 3,
     },
     api: {
+    }
+};
+
+// Инициализация приложения
+(async function init() {
+    // Загружаем каталог перед инициализацией
+    await loadCatalogAsync();
+    
+    // Здесь будет основной код инициализации приложения
+    console.log('✓ App initialized');
+})();
