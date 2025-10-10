@@ -4,7 +4,7 @@
  * @param {string} csvText - CSV текст для парсинга
  * @returns {Array} - Массив объектов
  */
-function parseCSVToJSON(csvText) {
+export function parseCSVToJSON(csvText) {
     const lines = csvText.trim().split('\n');
     if (lines.length < 2) {
         throw new Error('CSV должен содержать как минимум заголовок и одну строку данных');
@@ -34,16 +34,16 @@ function parseCSVToJSON(csvText) {
 
 // Асинхронная загрузка каталога
 async function loadCatalogAsync() {
-  try {
-    const catalogModule = await import('./catalog.js');
-    window.FULL_CATALOG = catalogModule.default || [];
-    console.log('✓ Catalog loaded:', window.FULL_CATALOG.length, 'items');
-    return window.FULL_CATALOG;
-  } catch (error) {
-    console.error('✗ Failed to load catalog:', error);
-    window.FULL_CATALOG = [];
-    return [];
-  }
+    try {
+        const catalogModule = await import('./catalog.js');
+        window.FULL_CATALOG = catalogModule.default || [];
+        console.log('✓ Catalog loaded:', window.FULL_CATALOG.length, 'items');
+        return window.FULL_CATALOG;
+    } catch (error) {
+        console.error('✗ Failed to load catalog:', error);
+        window.FULL_CATALOG = [];
+        return [];
+    }
 }
 
 // --- КОНФИГУРАЦИЯ ---
