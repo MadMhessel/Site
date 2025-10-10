@@ -5,19 +5,16 @@
     <script>
         (function() {
             "use strict";
-            // Истина: edit без значения, или =1/true/on/yes
             function truthy(v) {
                 if (v == null) return false;
                 v = String(v).trim().toLowerCase();
                 return v === "" || v === "1" || v === "true" || v === "on" || v === "yes";
             }
-            // 1) Ищем edit в location.search
             var sp = new URLSearchParams(location.search);
             if (sp.has("edit") && truthy(sp.get("edit"))) {
                 sessionStorage.setItem("editModeRequested", "1");
                 return;
             }
-            // 2) Ищем edit в hash-параметрах, напр. "#/route?edit=1"
             var h = location.hash || "";
             var qIndex = h.indexOf("?");
             if (qIndex !== -1) {
@@ -32,14 +29,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>СтройМаркет - Автономный Каталог</title>
-    <!-- Tailwind -->
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- FontAwesome -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.7.2/css/all.min.css"
-          integrity="sha512-Evv84Mr4kqVGRNSgIGL/F/aIDqQb7xQ2vcrdIwxfjThSH8CSR7PBEakCr51Ck+w+/U6swU2Im1vVX0SVk9ABhg=="
-          crossorigin="anonymous" referrerpolicy="no-referrer" />
-    <!-- Sortable.js -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.7.2/css/all.min.css" integrity="sha512-Evv84Mr4kqVGRNSgIGL/F/aIDqQb7xQ2vcrdIwxfjThSH8CSR7PBEakCr51Ck+w+/U6swU2Im1vVX0SVk9ABhg==" crossorigin="anonymous" referrerpolicy="no-referrer" />
     <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.3/Sortable.min.js"></script>
+    <link rel="stylesheet" href="./styles.css">
 </head>
 <body class="bg-gray-50">
     <aside id="editor-bar" class="hidden" data-editor-active="false">
@@ -48,61 +41,22 @@
                 <i class="fas fa-pencil-alt"></i>
                 <span class="text-sm font-semibold">Режим редактирования</span>
             </div>
-            <button type="button" data-editor-action="exit"
-                    class="rounded-lg bg-red-500 px-3 py-1 text-sm font-semibold text-white transition hover:bg-red-600"
-                    aria-label="Выйти из режима редактирования">
-                Выйти
-            </button>
+            <button type="button" data-editor-action="exit" class="rounded-lg bg-red-500 px-3 py-1 text-sm font-semibold text-white transition hover:bg-red-600" aria-label="Выйти из режима редактирования">Выйти</button>
         </div>
         <div class="grid grid-cols-2 gap-2">
-            <button
-                type="button"
-                data-editor-action="undo"
-                class="rounded-lg bg-gray-200 px-3 py-2 text-sm font-semibold text-gray-700 transition hover:bg-gray-300"
-                aria-label="Отменить последнее изменение"
-                disabled
-            >
-                Отменить
-            </button>
-            <button
-                type="button"
-                data-editor-action="redo"
-                class="rounded-lg bg-gray-200 px-3 py-2 text-sm font-semibold text-gray-700 transition hover:bg-gray-300"
-                aria-label="Повторить отменённое изменение"
-                disabled
-            >
-                Повторить
-            </button>
+            <button type="button" data-editor-action="undo" class="rounded-lg bg-gray-200 px-3 py-2 text-sm font-semibold text-gray-700 transition hover:bg-gray-300" aria-label="Отменить последнее изменение" disabled>Отменить</button>
+            <button type="button" data-editor-action="redo" class="rounded-lg bg-gray-200 px-3 py-2 text-sm font-semibold text-gray-700 transition hover:bg-gray-300" aria-label="Повторить отменённое изменение" disabled>Повторить</button>
         </div>
-        <button
-            type="button"
-            data-editor-action="export"
-            class="w-full rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700"
-            aria-label="Экспортировать состояние сайта в JSON"
-        >
-            Экспорт JSON
-        </button>
-        <button
-            type="button"
-            data-editor-action="import"
-            class="w-full rounded-lg bg-amber-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-amber-600"
-            aria-label="Импортировать состояние сайта из JSON"
-        >
-            Импорт JSON
-        </button>
-        <input id="editor-import-input" type="file" accept="application/json" class="hidden" />
-        <p class="text-xs leading-snug text-gray-500">
-            Импорт заменит текущее состояние. Перед загрузкой сохраните резервную копию.
-        </p>
+        <button type="button" data-editor-action="export" class="w-full rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700" aria-label="Экспортировать состояние сайта в JSON">Экспорт JSON</button>
+        <button type="button" data-editor-action="import" class="w-full rounded-lg bg-amber-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-amber-600" aria-label="Импортировать состояние сайта из JSON">Импорт JSON</button>
+        <input type="file" accept="application/json" id="editor-import-input" class="hidden" />
+        <p class="text-xs leading-snug text-gray-500">Импорт заменит текущее состояние. Перед загрузкой сохраните резервную копию.</p>
     </aside>
     <div id="app" class="min-h-screen">
         <!-- Содержимое будет сгенерировано JS -->
     </div>
-    <script defer src="./editor.js"></script>
-    <!-- Загрузка единого файла логики -->
-    <script src="./app.js"></script>
-    <!-- Вспомогательный бутстрап редактора -->
-    <script defer src="./editor-boot.js"></script>
+    <script type="module" src="./app.js"></script>
+    <script type="module" src="./editor.js"></script>
     <script defer src="./editor-hardlock.js"></script>
 </body>
 </html>
